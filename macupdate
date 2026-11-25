@@ -1,0 +1,2660 @@
+#!/usr/bin/env bash
+#
+# macupdate — macOS güncelleme, bakım ve sağlık aracı
+# v6.0.7 — gerçek dry-run, gürültüsüz durumlar, modül kaydı, güvenli varsayılanlar
+#
+# Temel kullanım:
+#   macupdate                         # Güvenli çekirdek güncellemeler
+#   macupdate --report                # Güncelleme yapmadan kapsamlı rapor
+#   macupdate --dry-run               # Yapılacak komutları göster (hiçbirini çalıştırmaz)
+#   macupdate --doctor                # Kurulum/izin/sağlık kontrolleri
+#   macupdate --only <modül>[,<modül>]  # Seçili modüller (grubu kendiliğinden açar)
+#   macupdate --list-modules          # Modülleri gruplarıyla listele
+#
+# Sistem ve bakım:
+#   macupdate --install-system-updates
+#   macupdate --greedy
+#   macupdate --maintenance [--xcode-clean]
+#   macupdate --docker-prune [--docker-prune-volumes]
+#   macupdate --go-clean
+#   macupdate --aggressive-clean
+#
+# Genişletilmiş gruplar:
+#   macupdate --extended
+#   macupdate --editors
+#   macupdate --deep-clean
+#   macupdate --ollama-update
+#   macupdate --repos [path]          # ~/projects/{public,private,clones}
+#                                     # depoları: fetch + yalnız fast-forward
+#   macupdate --audit
+#   macupdate --inventory [path]
+#   macupdate --all                   # extended + editors + maintenance
+#                                     # (deep-clean dahil DEĞİL; ayrıca iste)
+#
+# Otomasyon:
+#   macupdate --json                  # İnsan özeti + JSON dosyası
+#   macupdate --json-only             # stdout yalnız JSON
+#   macupdate --json-file <path>
+#   macupdate --quiet
+#   macupdate --notify
+#   macupdate --yes                   # Onay sorularını evet say (deep-clean vb.)
+#   macupdate --init-config
+#   macupdate --unlock                # Yalnız bayat kilidi temizler
+#
+# Çıkış kodları:
+#   0   her şey tamam (güncel/güncellendi/atlandı)
+#   1   en az bir modül hata verdi
+#   2   en az bir modül kısmi kaldı ya da yeniden başlatma gerekiyor
+#   64  kullanım hatası (bilinmeyen parametre/modül)
+#   69  macOS değil
+#   75  başka bir macupdate çalışıyor (kilit)
+#
+# Config: ~/.config/macupdate/config.sh
+# Log:    ~/.cache/macupdate/macupdate-YYYYMMDD-HHMMSS.log  (latest.log → son)
+# JSON:   ~/.cache/macupdate/macupdate-YYYYMMDD-HHMMSS.json
+#
+# Güvenlik ilkeleri:
+#   • --dry-run hiçbir değiştiren komutu çalıştırmaz; yalnız salt-okunur
+#     sorgular (outdated/list/doctor) koşar.
+#   • Varsayılan çalıştırma cache silmez (npm/uv/pnpm/yarn cache, Docker,
+#     Xcode, Go modcache, SwiftPM). Bunlar --maintenance/--aggressive-clean ister.
+#   • deep-clean silmeden önce onay ister; tty yoksa --yes olmadan silmez.
+#   • conda'ya dokunulmaz (yalnız sürüm raporu); sudo gem/chown yapılmaz.
+#   • Durumlar gerçek sonuca göre: sayımlar yalnız stdout'tan yapılır,
+#     brew doctor uyarısı ve pinned formula'lar "kısmi" saydırmaz.
+#   • run.lock PID, süreç komutu, host ve benzersiz token ile doğrulanır.
+#
+# v6.0.7 değişiklikleri:
+#   • GREEDY_EXCLUDE varsayılanı boş. Önceki sürümler yazarın kendi cask
+#     listesini varsayılan olarak taşıyordu; liste artık config.sh'de
+#     tutulur:  GREEDY_EXCLUDE+=(cask-adi baska-cask)
+#   • DÜZELTME: --dry-run eski günlükleri siliyordu (rotate_logs dry-run'da da
+#     çalışıyordu: LOG_MAX_DAYS'ten eski ve LOG_MAX_FILES'ı aşan günlükler).
+#     Günlük döndürme artık dry-run'da atlanır.
+#
+# v6.0.6 değişiklikleri (--all çıktısındaki yanlış durumlar):
+#   • aws: çalışmayan ikili (ör. Rosetta'sız x86_64) uyarı + kısmi; "brew
+#     upgrade ile yapıldı" iddiası kalktı, kurulum türü raporlanır.
+#   • mise: self-update/upgrade hatası kısmi (yutulmuyordu); brew'le kurulu
+#     mise'de self-update çağrılmaz.
+#   • pyenv: pyenv-update eklentisi yoksa `pyenv update` çağrılmaz.
+#   • vscode: `code` komutu Cursor.app'e aitse atlanır (eklentiler cursor
+#     modülünde; iki kez --force kuruluyordu).
+#   • cache: uv süreci çalışıyorsa (uvx MCP sunucuları kilidi tutar) uv cache
+#     prune 60 sn beklemeden atlanır.
+#   • omz: banner ve git çıktısı yerine "eklenti +N commit"; hook'lar kapalı.
+#   • Testler: ortadaki `! cmd` doğrulamaları bats'ta set -e'den muaftı (hiç
+#     denetlenmiyordu); `|| false` ile zorunlu hale getirildi.
+#
+# v6.0.5 değişiklikleri:
+#   • --repos --dry-run depoları kova başına tek satırda listeler (40 ayrı
+#     komut satırı yerine).
+#   • --repos: fetch --prune ile uzak dalı silinmiş (upstream'i kalmamış)
+#     depo sessizce "güncel" sayılmaz, adıyla bildirilir.
+#
+# v6.0.4 değişiklikleri:
+#   • --repos yeniden yazıldı: ~/projects/{public,private,clones} kovalarının
+#     doğrudan alt depoları (REPOS_BUCKETS ile değişir; yerel/ ve iç içe
+#     klonlar hariç). Ağsız ön eleme: remote'suz, detached, upstream'siz ve
+#     izlenen dosyası değişmiş depolara dokunulmaz (adlar logda). Kalanlar
+#     paralel `git fetch --all --prune` (MACUPDATE_REPOS_JOBS=4, depo başı
+#     MACUPDATE_REPOS_TIMEOUT=60 sn, şifre/onay istemi beklemez) ve yalnız
+#     `git merge --ff-only @{u}`; depo hook'ları çalıştırılmaz. Ayrışmış ya da
+#     fetch'i başarısız depo adıyla "kısmi". Hâlâ yalnız --repos ile çalışır.
+#
+# v6.0.3 değişiklikleri:
+#   • DÜZELTME: deep-clean app-cache Xcode CodingAssistant dizinlerini
+#     (Agents/claude, Agents/codex = indirilmiş ajanlar; codex/ = Codex'in
+#     ayar/oturum dizini) "cache" diye siliyordu; listeden çıkarıldı.
+#   • node/python/rust kısmi gerekçesi başarısız alt komutu adıyla verir
+#     ("başarısız: bun upgrade").
+#   • Onay sorusu nedeni ayırır (tty yok / N sn yanıt yok / hayır); süre
+#     MACUPDATE_CONFIRM_TIMEOUT (varsayılan 60 sn); karar loga yazılır.
+#   • Log dosyasına ANSI renk kodu yazılmaz.
+#   • Ruby: gem update yalnız kullanıcının kurduğu gem'lere uygulanır; Ruby
+#     ile gelen (varsayılan/bundled) gem'ler atlanır ve "hâlâ eski" sayılmaz
+#     (argümansız gem update io-wait 1.0.0 ve rdoc 8.1.0'ı kurmuştu: her gem
+#     komutunda deprecation ve "already initialized constant" uyarıları).
+#
+# v6.0.2 değişiklikleri:
+#   • DÜZELTME: volta altında `npm update -g` her volta paketini sürüm aynı
+#     olsa da yeniden kuruyordu (npm REPLACE); allowScripts uyarıları her
+#     koşuda node'u "kısmi" ve çıkış kodunu 2 yapıyordu. Artık `npm view` ile
+#     yalnız yeni sürümü olan paket güncellenir; --dry-run/--report sayar.
+#   • HOMEBREW_NO_REQUIRE_TAP_TRUST export edilmez (Homebrew 7'de kullanımdan
+#     kalktı, her brew komutunda uyarı basıyordu).
+#   • brew-services: "error" durumundaki servis uyarılır; yalnız "none"
+#     olmayan servisler gösterilir.
+#   • Başlık kutusu hizalı; atlanan modülün gerekçesi tek satır; en yavaş
+#     modül süreleri hizalı; softwareupdate başlık gürültüsü gösterilmez;
+#     rustup update kendini denetlediyse rustup self update tekrarlanmaz.
+#
+# v6.0.1 değişiklikleri:
+#   • Ruby ön-kontrolü plugins/ altındaki symlink'leri de denetler (brew
+#     Ruby'de rdoc_plugin.rb → Cellar'daki salt-okunur dosya → EACCES).
+#   • Node: volta paketlerinin sürüm değişimi sayılır ("0 güncellendi"
+#     yanıltmasın); kısmi gerekçeleri (engellenen script, hâlâ eski, hata)
+#     birlikte raporlanır.
+#
+# v6.0.0 değişiklikleri (v5'e göre):
+#   • DÜZELTME: --dry-run pipx upgrade-all, rustup update, cargo install-update
+#     komutlarını gerçekten çalıştırıyordu.
+#   • DÜZELTME: Ruby "N gem hâlâ eski" sayımı stderr uyarılarını sayıyordu.
+#   • DÜZELTME: MAS_SKIP_IDS ile atlanan uygulama "kaldı" sayılıyordu.
+#   • DÜZELTME: --only doğrulanmıyordu; kilide takılan çalıştırma boş log
+#     bırakıyordu; --json-only stdout'una alt komut çıktısı karışıyordu.
+#   • Kullanım hatası 2 yerine 64 (2 = kısmi). Yeni durum: "planned" (dry-run).
+#   • Volta'nın paketlediği npm sayılmaz; npm allowScripts engeli paket adıyla
+#     raporlanır; pnpm global paket yoksa atlanır; uv tool upgrade --all eklendi.
+#   • yarn/pnpm/uv/npm cache bakımı --maintenance'a taşındı; uv cache prune
+#     zaman aşımlı (MACUPDATE_UV_PRUNE_TIMEOUT, varsayılan 60 sn).
+#   • conda update kaldırıldı; SwiftPM/composer cache silme --aggressive-clean'e.
+#   • --all artık deep-clean içermez; deep-clean onay ister.
+#   • --list-modules, --only a,b; latest.log symlink'i geri geldi.
+# ----------------------------------------------------------------------
+
+# ── Bash 4.3+ gereksinimi ─────────────────────────────────────────────
+# macOS varsayılan /bin/bash 3.2'dir; associative array (declare -A) ve
+# nameref (local -n) desteklemez. Homebrew bash kuruluysa onunla yeniden başlat.
+if [[ -z "${BASH_VERSINFO:-}" ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    for _b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        [[ -x "$_b" ]] && exec "$_b" "$0" "$@"
+    done
+    echo "Bu script bash 4.3+ gerektirir (declare -A, local -n). Kur: brew install bash" >&2
+    exit 1
+fi
+
+VERSION="6.0.7"
+EX_PARTIAL=2
+EX_USAGE=64
+EX_UNAVAILABLE=69
+EX_LOCKED=75
+LOG_DIR="$HOME/.cache/macupdate"
+RUN_STAMP=$(date +%Y%m%d-%H%M%S)
+LOG_FILE="$LOG_DIR/macupdate-${RUN_STAMP}.log"
+CONFIG_FILE="${MACUPDATE_CONFIG:-$HOME/.config/macupdate/config.sh}"
+START_TS=$(date +%s)
+JSON_FILE_DEFAULT="$LOG_DIR/macupdate-${RUN_STAMP}.json"
+
+# Flag'ler
+DRY_RUN=0
+REPORT_ONLY=0
+SKIP_SYSTEM=0
+SKIP_DOCKER=0
+SKIP_CACHE=0
+SKIP_XCODE=0
+GREEDY=0
+RUN_CORE=1
+RUN_EXTENDED=0
+RUN_EDITORS=0
+RUN_MAINTENANCE=0
+RUN_DEEP_CLEAN=0
+RUN_OLLAMA=0
+RUN_REPOS=0
+RUN_AUDIT=0
+RUN_INVENTORY=0
+REPOS_DIR="$HOME/projects"
+REPOS_BUCKETS=(public private clones)   # --repos: bu kovaların doğrudan alt depoları
+REPOS_JOBS="${MACUPDATE_REPOS_JOBS:-4}"
+REPOS_TIMEOUT="${MACUPDATE_REPOS_TIMEOUT:-60}"
+INVENTORY_DIR="${INVENTORY_DIR:-$HOME/system-inventory}"
+ONLY_MODULE=""
+LIST_MODULES=0
+ASSUME_YES=0
+UV_PRUNE_TIMEOUT="${MACUPDATE_UV_PRUNE_TIMEOUT:-60}"
+CONFIRM_TIMEOUT="${MACUPDATE_CONFIRM_TIMEOUT:-60}"
+CONFIRM_WHY=""
+INSTALL_SYSTEM_UPDATES=0
+DOCKER_PRUNE=0
+DOCKER_PRUNE_VOLUMES=0
+XCODE_CLEAN=0
+GO_CLEAN=0
+AGGRESSIVE_CLEAN=0
+JSON_MODE=0
+JSON_ONLY=0
+JSON_FILE=""
+QUIET=0
+NOTIFY=0
+DOCTOR_ONLY=0
+INIT_CONFIG=0
+UNLOCK_ONLY=0
+LOG_ROTATE=1
+LOG_MAX_DAYS="${MACUPDATE_LOG_MAX_DAYS:-30}"
+LOG_MAX_FILES="${MACUPDATE_LOG_MAX_FILES:-100}"
+REBOOT_REQUIRED=0
+PENDING_UPDATES=0
+HEALTH_SCORE=100
+
+# --greedy ile bile güncellenmeyecek cask'lar. Varsayılan boş; kendi listen için
+# config.sh içine:  GREEDY_EXCLUDE+=(cask-adi baska-cask)
+GREEDY_EXCLUDE=()
+
+export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+export MAS_NO_AUTO_INDEX=1
+export HOMEBREW_NO_ENV_HINTS=1
+# HOMEBREW_NO_REQUIRE_TAP_TRUST bilerek ayarlanmaz: Homebrew 7'de kullanımdan
+# kalktı ve her brew komutunda uyarı basar; üçüncü-taraf tap'ler `brew trust` ile.
+export NONINTERACTIVE=1
+
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+if ! declare -p MAS_SKIP_IDS >/dev/null 2>&1; then
+    declare -a MAS_SKIP_IDS=()
+fi
+
+
+if [[ -t 1 ]]; then
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
+else
+    BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""
+fi
+
+declare -a UPDATED=()
+declare -a CURRENT=()
+declare -a AVAILABLE=()
+declare -a COMPLETED=()
+declare -a PARTIALS=()
+declare -a FAILURES=()
+declare -a SKIPPED=()
+declare -a WARNINGS=()
+declare -a REPORTED=()
+declare -a PLANNED=()
+declare -a MODULE_ORDER=()
+declare -A TIMINGS=()
+declare -A MODULE_STATUS_MAP=()
+declare -A MODULE_DETAIL_MAP=()
+
+# Modül kaydı: "grup:ad:fonksiyon" — çalışma sırası, --only doğrulaması ve
+# --list-modules tek kaynaktan beslenir.
+MODULE_REGISTRY=(
+    "doctor:doctor:mod_doctor"
+    "core:softwareupdate:mod_softwareupdate"
+    "core:mas:mod_mas"
+    "core:brew:mod_brew"
+    "core:node:mod_node"
+    "core:python:mod_python"
+    "core:rust:mod_rust"
+    "core:ruby:mod_ruby"
+    "core:go:mod_go"
+    "core:docker:mod_docker"
+    "core:cache:mod_cache"
+    "core:brew-services:mod_brew_services"
+    "extended:deno:mod_deno"
+    "extended:flutter:mod_flutter"
+    "extended:haskell:mod_haskell"
+    "extended:composer:mod_composer"
+    "extended:asdf:mod_asdf"
+    "extended:mise:mod_mise"
+    "extended:swift:mod_swift"
+    "extended:gcloud:mod_gcloud"
+    "extended:aws:mod_aws"
+    "extended:az:mod_azcli"
+    "extended:heroku:mod_heroku"
+    "extended:dotnet:mod_dotnet"
+    "extended:pyenv:mod_pyenv"
+    "extended:krew:mod_krew"
+    "extended:helm:mod_helm"
+    "editors:vscode:mod_vscode"
+    "editors:vscode-insiders:mod_vscode_insiders"
+    "editors:cursor:mod_cursor"
+    "editors:windsurf:mod_windsurf"
+    "editors:neovim:mod_neovim"
+    "editors:tmux:mod_tmux"
+    "editors:omz:mod_omz"
+    "editors:fzf:mod_fzf"
+    "deep-clean:browser-cache:mod_browser_cache"
+    "deep-clean:app-cache:mod_app_cache"
+    "deep-clean:mail-downloads:mod_mail_downloads"
+    "deep-clean:ios-backups:mod_ios_backups"
+    "deep-clean:system-logs:mod_system_logs"
+    "ollama:ollama:mod_ollama"
+    "repos:repos:mod_repos"
+    "audit:audit-unmanaged:mod_audit_unmanaged"
+    "audit:audit-broken-casks:mod_audit_broken_casks"
+    "audit:audit-duplicates:mod_audit_duplicates"
+    "audit:audit-orphans:mod_audit_orphan_formulae"
+    "inventory:inventory:mod_inventory"
+)
+GROUP_ORDER=(doctor core extended editors deep-clean ollama repos audit inventory)
+
+MODULE_STATUS=""
+MODULE_DETAIL=""
+
+# ── Yardımcı fonksiyonlar ─────────────────────────────────────────────
+log() {
+    local text="$*" plain="$*" c
+    # Renk kodları yalnız ekrana gider; log dosyası düz metin kalır.
+    if [[ -n "$RESET" ]]; then
+        for c in "$BOLD" "$DIM" "$RESET" "$RED" "$GREEN" "$YELLOW" "$BLUE" "$CYAN" "$MAGENTA"; do
+            plain=${plain//"$c"/}
+        done
+    fi
+    printf '%b\n' "$plain" >>"$LOG_FILE"
+    (( QUIET == 0 )) && printf '%b\n' "$text"
+}
+info()  { log "${CYAN}ℹ${RESET}  $*"; }
+ok()    { log "${GREEN}✓${RESET}  $*"; }
+warn()  { log "${YELLOW}⚠${RESET}  $*"; WARNINGS+=("$*"); }
+err()   { log "${RED}✗${RESET}  $*"; }
+note()  { log "${CYAN}ℹ${RESET}  $*"; }
+step()  { log "\n${BOLD}${BLUE}══▶ $*${RESET}"; }
+
+have()  { command -v "$1" >/dev/null 2>&1; }
+
+module_updated()   { MODULE_STATUS="updated";   MODULE_DETAIL="${1:-}"; }
+module_current()   { MODULE_STATUS="current";   MODULE_DETAIL="${1:-}"; }
+module_available() { MODULE_STATUS="available"; MODULE_DETAIL="${1:-}"; }
+module_completed() { MODULE_STATUS="completed"; MODULE_DETAIL="${1:-}"; }
+module_partial()   { MODULE_STATUS="partial";   MODULE_DETAIL="${1:-}"; }
+module_failed()    { MODULE_STATUS="failed";    MODULE_DETAIL="${1:-}"; }
+module_skipped()   { MODULE_STATUS="skipped";   MODULE_DETAIL="${1:-}"; }
+module_reported()  { MODULE_STATUS="reported";  MODULE_DETAIL="${1:-}"; }
+module_planned()   { MODULE_STATUS="planned";   MODULE_DETAIL="${1:-}"; }
+
+array_add_unique() {
+    local -n __arr="$1"
+    local value="$2" existing
+    for existing in "${__arr[@]}"; do [[ "$existing" == "$value" ]] && return 0; done
+    __arr+=("$value")
+}
+
+record_module_result() {
+    local name="$1" status="$2" detail="${3:-}"
+    MODULE_STATUS_MAP["$name"]="$status"
+    MODULE_DETAIL_MAP["$name"]="$detail"
+    array_add_unique MODULE_ORDER "$name"
+    case "$status" in
+        updated)   array_add_unique UPDATED "$name" ;;
+        current)   array_add_unique CURRENT "$name" ;;
+        available) array_add_unique AVAILABLE "$name" ;;
+        completed) array_add_unique COMPLETED "$name" ;;
+        partial)   array_add_unique PARTIALS "$name" ;;
+        failed)    array_add_unique FAILURES "$name" ;;
+        skipped)   array_add_unique SKIPPED "$name" ;;
+        reported)  array_add_unique REPORTED "$name" ;;
+        planned)   array_add_unique PLANNED "$name" ;;
+    esac
+}
+
+sh_run() {
+    log "${DIM}\$ $*${RESET}"
+    [[ $DRY_RUN -eq 1 ]] && return 0
+    if (( QUIET == 1 )); then
+        "$@" >>"$LOG_FILE" 2>&1
+        return $?
+    fi
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    return "${PIPESTATUS[0]}"
+}
+
+sh_run_quiet() {
+    local filter="$1"; shift
+    local tmp rc
+    tmp=$(mktemp "${TMPDIR:-/tmp}/macupdate.XXXXXX") || return 1
+    log "${DIM}\$ $*${RESET}"
+    if [[ $DRY_RUN -eq 1 ]]; then rm -f "$tmp"; return 0; fi
+    "$@" >"$tmp" 2>&1; rc=$?
+    cat "$tmp" >>"$LOG_FILE"
+    if (( QUIET == 0 )); then grep -E "$filter" "$tmp" | tail -30 || true; fi
+    rm -f "$tmp"
+    return $rc
+}
+
+capture_logged() {
+    local __var="$1"; shift
+    local tmp rc payload
+    tmp=$(mktemp "${TMPDIR:-/tmp}/macupdate.XXXXXX") || return 1
+    "$@" >"$tmp" 2>&1; rc=$?
+    payload=$(cat "$tmp")
+    cat "$tmp" >>"$LOG_FILE"
+    rm -f "$tmp"
+    printf -v "$__var" '%s' "$payload"
+    return $rc
+}
+
+# Salt-okunur sorgu: yalnız stdout değişkene alınır (sayım/parse için),
+# stderr (uyarılar) yalnız loga gider. Dry-run'da da çalışır.
+capture_stdout() {
+    local __var="$1"; shift
+    local tmp rc payload
+    tmp=$(mktemp "${TMPDIR:-/tmp}/macupdate.XXXXXX") || return 1
+    "$@" >"$tmp" 2>>"$LOG_FILE"; rc=$?
+    payload=$(cat "$tmp")
+    [[ -n "$payload" ]] && printf '%s\n' "$payload" >>"$LOG_FILE"
+    rm -f "$tmp"
+    printf -v "$__var" '%s' "$payload"
+    return $rc
+}
+
+# Sistemi değiştiren komut: "$ …" satırını loglar, dry-run'da ÇALIŞTIRMAZ,
+# aksi halde stdout+stderr'i değişkene alır.
+run_capture() {
+    local __var="$1"; shift
+    log "${DIM}\$ $*${RESET}"
+    if (( DRY_RUN == 1 )); then printf -v "$__var" '%s' ""; return 0; fi
+    capture_logged "$__var" "$@"
+}
+
+# Harici bağımlılıksız zaman aşımı; aşımda 124 döner.
+run_with_timeout() {
+    local timeout_s="$1"; shift
+    log "${DIM}\$ $* (zaman aşımı ${timeout_s}s)${RESET}"
+    (( DRY_RUN == 1 )) && return 0
+    "$@" >>"$LOG_FILE" 2>&1 &
+    local pid=$! i=0 rc=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( i >= timeout_s )); then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        ((i+=1))
+    done
+    wait "$pid" || rc=$?
+    return "$rc"
+}
+
+safe_rm() {
+    log "${DIM}\$ rm -rf $*${RESET}"
+    [[ $DRY_RUN -eq 1 ]] && return 0
+    rm -rf "$@" 2>/dev/null
+    return 0
+}
+
+# Gerekçe yalnız durum ayrıntısına yazılır; run_module'ün "atlandı" satırı
+# onu zaten gösterir (ayrıca note basmak aynı cümleyi iki kez yazdırıyordu).
+skip_module() {
+    module_skipped "$1"
+    return 99
+}
+
+# confirm MESAJ [Y|N] — evetse 0. Hayırsa nedeni CONFIRM_WHY'a yazar; atlama
+# gerekçesi "tty yok", "yanıt yok" ve "hayır" durumlarını karıştırmasın.
+confirm() {
+    local msg="$1"; local default="${2:-N}"
+    local prompt="[e/H]" ans rc
+    [[ "$default" == "Y" ]] && prompt="[E/h]"
+    CONFIRM_WHY=""
+    (( ASSUME_YES == 1 )) && return 0
+    if (( DRY_RUN == 1 )); then
+        log "${DIM}[dry-run: $msg $prompt → otomatik iptal]${RESET}"
+        CONFIRM_WHY="dry-run"; return 1
+    fi
+    if [[ ! -t 0 ]]; then
+        [[ "$default" =~ ^[YyEe]$ ]] && return 0
+        CONFIRM_WHY="tty yok, --yes gerekir"; return 1
+    fi
+    read -r -t "$CONFIRM_TIMEOUT" -p "$msg $prompt " ans; rc=$?
+    if (( rc > 128 )); then
+        printf '\n' >&2
+        ans="$default"; CONFIRM_WHY="$CONFIRM_TIMEOUT sn içinde yanıt yok"
+    else
+        [[ -z "$ans" ]] && ans="$default"
+        CONFIRM_WHY="yanıt: hayır"
+    fi
+    [[ -e "$LOG_FILE" ]] && printf '? %s %s → %s\n' "$msg" "$prompt" "$ans" >>"$LOG_FILE"
+    [[ "$ans" =~ ^[EeYy]$ ]] && { CONFIRM_WHY=""; return 0; }
+    return 1
+}
+
+only_has() { [[ ",$ONLY_MODULE," == *",$1,"* ]]; }
+module_selected() { [[ -z "$ONLY_MODULE" ]] || only_has "$1"; }
+
+run_module() {
+    local name="$1" fn="$2" start elapsed rc status detail
+    MODULE_STATUS=""
+    MODULE_DETAIL=""
+    module_selected "$name" || return 0
+    step "[$name]"
+    start=$(date +%s)
+
+    if (( REPORT_ONLY == 1 )); then
+        if declare -f "${fn}_report" >/dev/null; then
+            "${fn}_report"; rc=$?
+            [[ -z "$MODULE_STATUS" ]] && {
+                (( rc == 0 )) && module_reported "raporlandı" || module_failed "rapor sorgusu başarısız (rc=$rc)"
+            }
+        else
+            module_skipped "rapor desteği yok"
+            note "Rapor modu desteklenmiyor"
+            rc=99
+        fi
+    else
+        "$fn"; rc=$?
+        if [[ -z "$MODULE_STATUS" ]]; then
+            case $rc in
+                0)  module_completed "tamamlandı" ;;
+                99) module_skipped "atlandı" ;;
+                *)  module_failed "rc=$rc" ;;
+            esac
+        elif (( rc != 0 && rc != 99 )) && [[ "$MODULE_STATUS" != "partial" && "$MODULE_STATUS" != "failed" ]]; then
+            module_failed "${MODULE_DETAIL:-rc=$rc}"
+        fi
+        # Dry-run'da hiçbir şey değişmediği için "güncellendi/tamam" yanıltıcıdır.
+        if (( DRY_RUN == 1 )) && [[ "$MODULE_STATUS" == "updated" || "$MODULE_STATUS" == "completed" ]]; then
+            module_planned "dry-run${MODULE_DETAIL:+ — $MODULE_DETAIL}"
+        fi
+    fi
+
+    elapsed=$(( $(date +%s) - start ))
+    TIMINGS["$name"]=$elapsed
+    status="$MODULE_STATUS"; detail="$MODULE_DETAIL"
+    record_module_result "$name" "$status" "$detail"
+    case "$status" in
+        updated)   ok "$name güncellendi (${elapsed}s)${detail:+ — $detail}" ;;
+        current)   ok "$name güncel (${elapsed}s)${detail:+ — $detail}" ;;
+        available) log "${YELLOW}↑${RESET}  $name güncelleme mevcut (${elapsed}s)${detail:+ — $detail}" ;;
+        completed) ok "$name tamam (${elapsed}s)${detail:+ — $detail}" ;;
+        partial)   log "${YELLOW}◐${RESET}  $name kısmi (${elapsed}s)${detail:+ — $detail}" ;;
+        failed)    err "$name hata (${elapsed}s)${detail:+ — $detail}" ;;
+        skipped)   log "${YELLOW}↯${RESET}  $name atlandı (${elapsed}s)${detail:+ — $detail}" ;;
+        reported)  log "${CYAN}≡${RESET}  $name raporlandı (${elapsed}s)${detail:+ — $detail}" ;;
+        planned)   log "${CYAN}○${RESET}  $name planlandı (${elapsed}s)${detail:+ — $detail}" ;;
+    esac
+    return 0
+}
+
+disk_free_gb() { df -g / | awk 'NR==2 {print $4}'; }
+disk_used_kb() { [[ -e "$1" ]] && du -sk "$1" 2>/dev/null | awk '{print $1}' || echo 0; }
+human_kb() {
+    local kb=${1:-0}
+    if (( kb >= 1048576 )); then awk -v n="$kb" 'BEGIN{printf "%.2f GB",n/1048576}'
+    elif (( kb >= 1024 )); then awk -v n="$kb" 'BEGIN{printf "%.1f MB",n/1024}'
+    else printf "%d KB" "$kb"
+    fi
+}
+line_count() { awk 'NF{n++} END{print n+0}' <<<"${1:-}"; }
+# join_list a b c → "a, b, c" (kısmi durum gerekçelerinde başarısız komut adları)
+join_list() { local out; printf -v out '%s, ' "$@"; printf '%s' "${out%, }"; }
+# resolve_path YOL — symlink'leri çözülmüş gerçek yol (çözülemezse olduğu gibi)
+resolve_path() { realpath "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# JSON nesnesinin üst düzey anahtarları (satır başına bir tane)
+json_keys() {
+    local data="${1:-}"
+    [[ -z "$data" ]] && return 0
+    if have python3; then
+        python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(d,dict):
+    print("\n".join(d))' <<<"$data" 2>/dev/null
+    else
+        grep -oE '^  "[^"]+"[[:space:]]*:' <<<"$data" | sed -E 's/^  "([^"]+)".*/\1/' || true
+    fi
+}
+
+# `npm outdated -g --json` → eski paket adları. Volta altında node imajının
+# paketlediği npm/corepack `npm update -g` ile güncellenemez; sayılmaz.
+npm_outdated_names() {
+    local names
+    names=$(json_keys "${1:-}")
+    if have volta; then
+        names=$(grep -vxE 'npm|corepack' <<<"$names" || true)
+    fi
+    printf '%s' "$names"
+}
+
+# `gem outdated` stdout'unda yalnız "ad (eski < yeni)" satırlarının adları
+gem_outdated_names() {
+    awk '/^[A-Za-z0-9_.-]+ \([^)]* < [^)]*\)$/ {print $1}' <<<"${1:-}"
+}
+
+# gem_user_outdated OUTDATED SHIPPED — Ruby ile gelmeyen eski gem adları
+gem_user_outdated() {
+    gem_outdated_names "$1" | grep -vxF -f <(printf '%s\n' "${2:-}") || true
+}
+
+mas_id_skipped() {
+    local s
+    for s in "${MAS_SKIP_IDS[@]}"; do [[ "$s" == "$1" ]] && return 0; done
+    return 1
+}
+
+# ── Modül kaydı yardımcıları ──────────────────────────────────────────
+registry_group_of() {
+    local entry g n rest
+    for entry in "${MODULE_REGISTRY[@]}"; do
+        IFS=: read -r g n rest <<<"$entry"
+        [[ "$n" == "$1" ]] && { printf '%s' "$g"; return 0; }
+    done
+    return 1
+}
+
+enable_group() {
+    case "$1" in
+        doctor)     DOCTOR_ONLY=1 ;;
+        core)       RUN_CORE=1 ;;
+        extended)   RUN_EXTENDED=1 ;;
+        editors)    RUN_EDITORS=1 ;;
+        deep-clean) RUN_DEEP_CLEAN=1 ;;
+        ollama)     RUN_OLLAMA=1 ;;
+        repos)      RUN_REPOS=1 ;;
+        audit)      RUN_AUDIT=1 ;;
+        inventory)  RUN_INVENTORY=1 ;;
+    esac
+}
+
+group_enabled() {
+    case "$1" in
+        doctor)     (( DOCTOR_ONLY == 1 )) ;;
+        core)       (( RUN_CORE == 1 )) ;;
+        extended)   (( RUN_EXTENDED == 1 )) ;;
+        editors)    (( RUN_EDITORS == 1 )) ;;
+        deep-clean) (( RUN_DEEP_CLEAN == 1 )) ;;
+        ollama)     (( RUN_OLLAMA == 1 )) ;;
+        repos)      (( RUN_REPOS == 1 )) ;;
+        audit)      (( RUN_AUDIT == 1 )) ;;
+        inventory)  (( RUN_INVENTORY == 1 )) ;;
+        *)          return 1 ;;
+    esac
+}
+
+list_modules() {
+    local grp entry g n rest
+    for grp in "${GROUP_ORDER[@]}"; do
+        printf '%s:\n' "$grp"
+        for entry in "${MODULE_REGISTRY[@]}"; do
+            IFS=: read -r g n rest <<<"$entry"
+            [[ "$g" == "$grp" ]] && printf '  %s\n' "$n"
+        done
+    done
+}
+
+usage_error() {
+    echo "$1" >&2
+    echo "Yardım: $0 --help" >&2
+    exit "$EX_USAGE"
+}
+
+rotate_logs() {
+    (( LOG_ROTATE == 1 )) || return 0
+    (( DRY_RUN == 1 )) && return 0    # dry-run hiçbir şey silmez; eski günlükler de kalır
+    find "$LOG_DIR" -maxdepth 1 -type f \( -name 'macupdate-*.log' -o -name 'macupdate-*.json' \) \
+        -mtime "+$LOG_MAX_DAYS" -delete 2>/dev/null || true
+    local files extra
+    mapfile -t files < <(find "$LOG_DIR" -maxdepth 1 -type f -name 'macupdate-*.log' -print 2>/dev/null | sort -r)
+    extra=$(( ${#files[@]} - LOG_MAX_FILES ))
+    if (( extra > 0 )); then
+        printf '%s\n' "${files[@]:LOG_MAX_FILES}" | while IFS= read -r f; do
+            rm -f "$f" "${f%.log}.json" 2>/dev/null || true
+        done
+    fi
+}
+
+# ── Argüman parse ─────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)       DRY_RUN=1 ;;
+        --report)        REPORT_ONLY=1 ;;
+        --doctor)        DOCTOR_ONLY=1; RUN_CORE=0 ;;
+        --json)          JSON_MODE=1 ;;
+        --json-only)     JSON_MODE=1; JSON_ONLY=1; QUIET=1 ;;
+        --json-file)     [[ -n "${2:-}" && "$2" != -* ]] || usage_error "--json-file yol ister"; JSON_MODE=1; JSON_FILE="$2"; shift ;;
+        --quiet)         QUIET=1 ;;
+        --notify)        NOTIFY=1 ;;
+        --no-notify)     NOTIFY=0 ;;
+        --init-config)   INIT_CONFIG=1 ;;
+        --unlock)        UNLOCK_ONLY=1 ;;
+        --no-log-rotate) LOG_ROTATE=0 ;;
+        --greedy)        GREEDY=1 ;;
+        --skip-system)   SKIP_SYSTEM=1 ;;
+        --skip-docker)   SKIP_DOCKER=1 ;;
+        --skip-cache)    SKIP_CACHE=1 ;;
+        --skip-xcode)    SKIP_XCODE=1 ;;
+        --install-system-updates) INSTALL_SYSTEM_UPDATES=1 ;;
+        --docker-prune) DOCKER_PRUNE=1 ;;
+        --docker-prune-volumes) DOCKER_PRUNE=1; DOCKER_PRUNE_VOLUMES=1 ;;
+        --xcode-clean) XCODE_CLEAN=1 ;;
+        --go-clean) GO_CLEAN=1 ;;
+        --aggressive-clean) AGGRESSIVE_CLEAN=1 ;;
+        --extended)      RUN_EXTENDED=1 ;;
+        --editors)       RUN_EDITORS=1 ;;
+        --maintenance)   RUN_MAINTENANCE=1 ;;
+        --deep-clean)    RUN_DEEP_CLEAN=1 ;;
+        --ollama-update) RUN_OLLAMA=1 ;;
+        --repos)
+            RUN_REPOS=1
+            if [[ -n "${2:-}" && "$2" != -* ]]; then REPOS_DIR="$2"; shift; fi ;;
+        --audit)         RUN_AUDIT=1 ;;
+        --inventory)
+            RUN_INVENTORY=1
+            if [[ -n "${2:-}" && "$2" != -* ]]; then INVENTORY_DIR="$2"; shift; fi ;;
+        --all) RUN_EXTENDED=1; RUN_EDITORS=1; RUN_MAINTENANCE=1 ;;
+        --only) [[ -n "${2:-}" && "$2" != -* ]] || usage_error "--only modül adı ister (bkz. --list-modules)"; ONLY_MODULE="$2"; shift ;;
+        --list-modules)  LIST_MODULES=1 ;;
+        -y|--yes) ASSUME_YES=1 ;;
+        --empty-trash|--no-empty-trash)
+            echo "Not: $1 v6'da etkisiz (macupdate çöp kutusunu boşaltmaz)" >&2 ;;
+        -v|--version) echo "macupdate $VERSION"; exit 0 ;;
+        -h|--help)
+            sed -n '/^# macupdate —/,/^# -\{10,\}/p' "$0" | sed 's/^# \{0,1\}//; /^-\{10,\}/d'
+            exit 0 ;;
+        *) usage_error "Bilinmeyen parametre: $1" ;;
+    esac
+    shift
+done
+
+if (( LIST_MODULES == 1 )); then list_modules; exit 0; fi
+
+# --only doğrula; seçilen modülün grubu açık değilse kendiliğinden aç
+if [[ -n "$ONLY_MODULE" ]]; then
+    ONLY_MODULE="${ONLY_MODULE// /}"
+    IFS=, read -r -a _only_list <<<"$ONLY_MODULE"
+    for _m in "${_only_list[@]}"; do
+        [[ -z "$_m" ]] && continue
+        _g=$(registry_group_of "$_m") || usage_error "Bilinmeyen modül: $_m (geçerli adlar için --list-modules)"
+        enable_group "$_g"
+    done
+    unset _only_list _m _g
+fi
+
+mkdir -p "$LOG_DIR"
+
+init_config() {
+    local dir
+    dir=$(dirname "$CONFIG_FILE")
+    mkdir -p "$dir"
+    if [[ -e "$CONFIG_FILE" ]] && ! confirm "$CONFIG_FILE üzerine yazılsın mı?" "N"; then
+        echo "İptal edildi: $CONFIG_FILE"
+        exit 0
+    fi
+    cat >"$CONFIG_FILE" <<'CFG'
+# macupdate v6 yapılandırması
+GREEDY=0
+NOTIFY=0
+LOG_MAX_DAYS=30
+LOG_MAX_FILES=100
+# UV_PRUNE_TIMEOUT=60
+# GREEDY_EXCLUDE+=(ornek-cask)
+# MAS_SKIP_IDS+=(1569813296)
+CFG
+    chmod 600 "$CONFIG_FILE"
+    echo "Oluşturuldu: $CONFIG_FILE"
+    exit 0
+}
+
+[[ $INIT_CONFIG -eq 1 ]] && init_config
+
+LOCK_DIR="$LOG_DIR/run.lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
+LOCK_STARTED_FILE="$LOCK_DIR/started"
+LOCK_HOST_FILE="$LOCK_DIR/host"
+LOCK_COMMAND_FILE="$LOCK_DIR/command"
+LOCK_VERSION_FILE="$LOCK_DIR/version"
+LOCK_TOKEN_FILE="$LOCK_DIR/token"
+SUDO_KEEPALIVE_PID=""
+STALE_LOCK_CLEARED=0
+LOCK_TOKEN="${RANDOM:-0}-$$-$(date +%s)"
+
+write_lock_metadata() {
+    printf '%s\n' "$$" >"$LOCK_PID_FILE"
+    date '+%Y-%m-%d %H:%M:%S %z' >"$LOCK_STARTED_FILE"
+    hostname >"$LOCK_HOST_FILE" 2>/dev/null || true
+    ps -p $$ -o command= >"$LOCK_COMMAND_FILE" 2>/dev/null || printf '%s\n' "$0" >"$LOCK_COMMAND_FILE"
+    printf '%s\n' "$VERSION" >"$LOCK_VERSION_FILE"
+    printf '%s\n' "$LOCK_TOKEN" >"$LOCK_TOKEN_FILE"
+}
+
+lock_is_live() {
+    local pid cmd host current_host
+    [[ -r "$LOCK_PID_FILE" ]] || return 1
+    read -r pid <"$LOCK_PID_FILE" || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    host=""; [[ -r "$LOCK_HOST_FILE" ]] && read -r host <"$LOCK_HOST_FILE" || true
+    current_host=$(hostname 2>/dev/null || true)
+    [[ -z "$host" || -z "$current_host" || "$host" == "$current_host" ]] || return 1
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    [[ "$cmd" == *macupdate* ]]
+}
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then write_lock_metadata; return 0; fi
+    if lock_is_live; then
+        local old_pid old_started=""
+        read -r old_pid <"$LOCK_PID_FILE"
+        [[ -r "$LOCK_STARTED_FILE" ]] && read -r old_started <"$LOCK_STARTED_FILE" || true
+        echo "Başka bir macupdate çalışıyor: PID $old_pid${old_started:+, başlangıç $old_started}" >&2
+        return "$EX_LOCKED"
+    fi
+    rm -rf "$LOCK_DIR" 2>/dev/null || { echo "Bayat kilit temizlenemedi: $LOCK_DIR" >&2; return "$EX_LOCKED"; }
+    mkdir "$LOCK_DIR" 2>/dev/null || { echo "Kilit yeniden oluşturulamadı: $LOCK_DIR" >&2; return "$EX_LOCKED"; }
+    write_lock_metadata
+    STALE_LOCK_CLEARED=1
+}
+
+unlock_stale() {
+    if [[ ! -e "$LOCK_DIR" ]]; then echo "Kilit yok: $LOCK_DIR"; exit 0; fi
+    if lock_is_live; then
+        local p; read -r p <"$LOCK_PID_FILE"
+        echo "Kilit canlı bir macupdate sürecine ait (PID $p); silinmedi." >&2
+        exit "$EX_LOCKED"
+    fi
+    rm -rf "$LOCK_DIR" && echo "Bayat kilit silindi: $LOCK_DIR"
+    exit 0
+}
+
+cleanup_all() {
+    local rc=$? token=""
+    trap - EXIT INT TERM HUP
+    if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
+    [[ -r "$LOCK_TOKEN_FILE" ]] && read -r token <"$LOCK_TOKEN_FILE" || true
+    if [[ -d "$LOCK_DIR" && ( -z "$token" || "$token" == "$LOCK_TOKEN" ) ]]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
+    exit "$rc"
+}
+
+[[ $UNLOCK_ONLY -eq 1 ]] && unlock_stale
+acquire_lock || exit $?
+trap cleanup_all EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+# Log yalnız kilit alındıktan sonra oluşturulur (kilide takılan çalıştırma
+# boş log bırakmasın); döndürme de kilit altında yapılır.
+rotate_logs
+touch "$LOG_FILE"
+ln -sfn "$LOG_FILE" "$LOG_DIR/latest.log" 2>/dev/null || true
+
+# ── Başlık ────────────────────────────────────────────────────────────
+DISK_FREE_BEFORE=$(disk_free_gb)
+
+# Kutu kenarları sabit iç genişliğe göre çizilir; satır metni boşlukla
+# tamamlanır, uzunsa kırpılır (host adı/sürüm uzunluğu hizayı bozmasın).
+BOX_WIDTH=58
+box_border() {
+    local line
+    printf -v line '%*s' "$BOX_WIDTH" ''
+    log "${BOLD}${MAGENTA}$1${line// /═}$2${RESET}"
+}
+box_row() {
+    local text="$1"
+    (( ${#text} > BOX_WIDTH )) && text="${text:0:BOX_WIDTH}"
+    log "${BOLD}${MAGENTA}║${RESET}${text}$(printf '%*s' $(( BOX_WIDTH - ${#text} )) '')${BOLD}${MAGENTA}║${RESET}"
+}
+
+[[ -t 1 && "${MACUPDATE_NO_CLEAR:-0}" != "1" ]] && clear
+box_border ╔ ╗
+box_row "  macupdate v${VERSION}    $(date '+%Y-%m-%d %H:%M')"
+box_row "  $(scutil --get ComputerName 2>/dev/null || echo mac)   macOS $(sw_vers -productVersion)   ($(uname -m))"
+box_border ╚ ╝
+
+# Ön kontrol
+[[ "$(uname -s)" == "Darwin" ]] || { err "Bu script yalnız macOS içindir"; exit "$EX_UNAVAILABLE"; }
+if (( DISK_FREE_BEFORE < 10 )); then
+    warn "Boş disk alanı düşük: ${DISK_FREE_BEFORE} GB"
+fi
+
+groups=()
+[[ $DOCTOR_ONLY    -eq 1 ]] && groups+=("doctor")
+[[ $RUN_CORE       -eq 1 ]] && groups+=("core")
+[[ $RUN_EXTENDED   -eq 1 ]] && groups+=("extended")
+[[ $RUN_EDITORS    -eq 1 ]] && groups+=("editors")
+[[ $RUN_MAINTENANCE -eq 1 ]] && groups+=("maintenance")
+[[ $RUN_DEEP_CLEAN -eq 1 ]] && groups+=("deep-clean")
+[[ $RUN_OLLAMA     -eq 1 ]] && groups+=("ollama")
+[[ $RUN_REPOS      -eq 1 ]] && groups+=("repos")
+[[ $RUN_AUDIT      -eq 1 ]] && groups+=("audit")
+[[ $RUN_INVENTORY  -eq 1 ]] && groups+=("inventory")
+
+log "Log    : $LOG_FILE"
+log "Disk   : ${DISK_FREE_BEFORE} GB boşta"
+log "Modül  : ${groups[*]}${ONLY_MODULE:+ (yalnız: $ONLY_MODULE)}"
+[[ $REPORT_ONLY -eq 1 ]] && note "RAPOR MODU — güncelleme yapılmayacak"
+[[ $DRY_RUN     -eq 1 ]] && note "DRY-RUN — hiçbir değişiklik yapılmayacak"
+[[ $GREEDY      -eq 1 ]] && note "--greedy aktif (excludes: ${GREEDY_EXCLUDE[*]})"
+[[ $STALE_LOCK_CLEARED -eq 1 ]] && note "Bayat run.lock otomatik temizlendi"
+
+# sudo yalnız gerçekten gereken iki durumda: sistem güncellemesi kurulumu ve
+# --aggressive-clean ile sistem logu temizliği.
+NEED_SUDO=0
+if (( DRY_RUN == 0 && REPORT_ONLY == 0 )); then
+    (( INSTALL_SYSTEM_UPDATES == 1 && SKIP_SYSTEM == 0 && RUN_CORE == 1 )) && module_selected softwareupdate && NEED_SUDO=1
+    (( RUN_DEEP_CLEAN == 1 && AGGRESSIVE_CLEAN == 1 )) && module_selected system-logs && NEED_SUDO=1
+fi
+if (( NEED_SUDO == 1 )); then
+    info "Bu seçimler için sudo parolası gerekebilir..."
+    sudo -v || { err "Sudo alınamadı"; exit 1; }
+    ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+    SUDO_KEEPALIVE_PID=$!
+fi
+
+# ═════════════════════════════════════════════════════════════════════
+# CORE MODÜLLER
+# ═════════════════════════════════════════════════════════════════════
+
+# softwareupdate --list ekran çıktısı: sabit başlık satırları ve boş satırlar
+# atılır (tam çıktı logda kalır).
+softwareupdate_filter() {
+    grep -vE '^(Software Update Tool|Finding available software)?[[:space:]]*$' <<<"${1:-}" || true
+}
+
+mod_softwareupdate() {
+    [[ $SKIP_SYSTEM -eq 1 ]] && { skip_module "--skip-system"; return 99; }
+    local before after count rc has_restart remaining
+    log "${DIM}\$ softwareupdate --list${RESET}"
+    capture_logged before softwareupdate --list; rc=$?
+    (( QUIET == 0 )) && softwareupdate_filter "$before"
+    (( rc != 0 )) && { module_failed "softwareupdate sorgusu başarısız (rc=$rc)"; return $rc; }
+    count=$(grep -c '^\* Label:' <<<"$before" || true)
+    PENDING_UPDATES=$count
+    (( count == 0 )) && { module_current "sistem güncel"; return 0; }
+    has_restart=0; grep -q 'Action: restart' <<<"$before" && has_restart=1
+
+    if (( INSTALL_SYSTEM_UPDATES == 0 )); then
+        module_available "$count sistem güncellemesi bekliyor"
+        note "Yüklemek için: ${BOLD}$0 --install-system-updates${RESET}"
+        return 0
+    fi
+
+    if (( DRY_RUN == 1 )); then
+        sh_run sudo softwareupdate --install --all --verbose
+        module_available "$count sistem güncellemesi kurulacaktı"
+        return 0
+    fi
+    warn "Sistem güncellemeleri kurulacak; yeniden başlatma gerekebilir"
+    sh_run sudo softwareupdate --install --all --verbose; rc=$?
+    (( rc != 0 )) && { module_failed "kurulum başarısız (rc=$rc)"; return $rc; }
+
+    capture_logged after softwareupdate --list || true
+    remaining=$(grep -c '^\* Label:' <<<"$after" || true)
+    if (( remaining == 0 )); then
+        module_updated "$count güncelleme kuruldu"
+    elif grep -q 'Action: restart' <<<"$after" || (( has_restart == 1 )); then
+        REBOOT_REQUIRED=1
+        module_partial "güncelleme hazırlandı; yeniden başlatma sonrası doğrulanacak"
+    else
+        module_partial "$remaining güncelleme hâlâ listeleniyor"
+    fi
+    return 0
+}
+
+mod_mas() {
+    have mas || { skip_module "mas yok (brew install mas)"; return 99; }
+    local before after ids id rc out remaining=0 updated=0 skipped_ids=0 skip_note=""
+    local -a targets=()
+    log "${DIM}\$ mas outdated${RESET}"
+    capture_stdout before mas outdated; rc=$?
+    (( QUIET == 0 )) && [[ -n "$before" ]] && printf '%s\n' "$before"
+    (( rc != 0 )) && { module_failed "mas outdated başarısız (rc=$rc)"; return $rc; }
+    ids=$(awk '/^[[:space:]]*[0-9]+[[:space:]]/ {print $1}' <<<"$before")
+    [[ -z "$ids" ]] && { module_current "App Store güncellemesi yok"; return 0; }
+
+    while read -r id; do
+        [[ -z "$id" ]] && continue
+        if mas_id_skipped "$id"; then
+            note "MAS ADAM ID $id config ile atlandı"
+            ((skipped_ids+=1)); continue
+        fi
+        targets+=("$id")
+    done <<<"$ids"
+    (( skipped_ids > 0 )) && skip_note="; $skipped_ids uygulama config ile atlandı"
+    (( ${#targets[@]} == 0 )) && { module_current "güncelleme yok${skip_note}"; return 0; }
+
+    if (( DRY_RUN == 1 )); then
+        for id in "${targets[@]}"; do log "${DIM}\$ mas upgrade $id${RESET}"; done
+        module_available "${#targets[@]} uygulama güncellenecekti${skip_note}"
+        return 0
+    fi
+
+    for id in "${targets[@]}"; do
+        run_capture out mas upgrade "$id" || true
+        (( QUIET == 0 )) && [[ -n "$out" ]] && printf '%s\n' "$out"
+    done
+
+    # mas çıkış koduna güvenme; listeyi yeniden sorgula
+    capture_stdout after mas outdated || true
+    for id in "${targets[@]}"; do
+        grep -qE "^[[:space:]]*${id}[[:space:]]" <<<"$after" && ((remaining+=1))
+    done
+    updated=$(( ${#targets[@]} - remaining ))
+
+    if (( remaining == 0 )); then
+        module_updated "$updated uygulama güncellendi${skip_note}"
+    elif (( updated > 0 )); then
+        warn "$remaining App Store uygulaması güncellenemedi; App Store'dan elle kontrol edin"
+        module_partial "$updated güncellendi, $remaining kaldı${skip_note}"
+    else
+        warn "$remaining App Store uygulaması mas ile indirilemedi; App Store'dan elle kontrol edin"
+        module_partial "$remaining uygulama bekliyor${skip_note}"
+    fi
+    return 0
+}
+
+# brew_outdated VAR formula|cask [PINNED] — stdout'tan eski paket adları
+# (PINNED satır listesindeki formula'lar hariç)
+brew_outdated() {
+    local __names="" __pinned="${3:-}"
+    if [[ "$2" == cask ]]; then
+        if (( GREEDY == 1 )); then capture_stdout __names brew outdated --cask --greedy --quiet || true
+        else capture_stdout __names brew outdated --cask --quiet || true; fi
+    else
+        capture_stdout __names brew outdated --formula --quiet || true
+        if [[ -n "$__pinned" && -n "$__names" ]]; then
+            __names=$(grep -vxF -f <(printf '%s\n' "$__pinned") <<<"$__names" || true)
+        fi
+    fi
+    printf -v "$1" '%s' "$__names"
+}
+
+mod_brew() {
+    have brew || { skip_module "brew yok"; return 99; }
+    local formulas_before casks_before formulas_after casks_after doctor_out doctor_rc
+    local before_count after_count updated_count=0 failed=0 doctor_note="" pinned=""
+
+    sh_run brew update || failed=1
+    capture_stdout pinned brew list --pinned || true
+    [[ -n "$pinned" ]] && note "Sabitlenmiş (pinned) formula'lar sayılmaz: $(paste -sd' ' - <<<"$pinned")"
+
+    brew_outdated formulas_before formula "$pinned"
+    brew_outdated casks_before cask
+    before_count=$(( $(line_count "$formulas_before") + $(line_count "$casks_before") ))
+    if (( before_count > 0 && QUIET == 0 )); then
+        printf '%s\n' "$formulas_before" "$casks_before" | awk 'NF' | sed 's/^/  ↑ /'
+    fi
+
+    sh_run brew upgrade || failed=1
+
+    if (( GREEDY == 1 )); then
+        local exclude_pattern id
+        local -a cask_array=()
+        exclude_pattern=$(IFS='|'; echo "${GREEDY_EXCLUDE[*]}")
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && cask_array+=("$id")
+        done < <(grep -vE "^($exclude_pattern)$" <<<"$casks_before" || true)
+        if (( ${#cask_array[@]} > 0 )); then
+            sh_run brew upgrade --cask "${cask_array[@]}" || failed=1
+        else
+            note "--greedy: güncellenecek cask yok"
+        fi
+    fi
+
+    if (( AGGRESSIVE_CLEAN == 1 )); then
+        sh_run brew cleanup --prune=all || failed=1
+        sh_run brew autoremove || failed=1
+    else
+        sh_run brew cleanup || failed=1
+        local auto_out
+        auto_out=$(brew autoremove --dry-run 2>/dev/null || true)
+        [[ -n "$auto_out" ]] && note "brew autoremove adayları silinmedi; --aggressive-clean ile uygulanır"
+    fi
+
+    # brew doctor salt-okunur; uyarısı bilgi amaçlıdır, durumu etkilemez
+    log "${DIM}\$ brew doctor${RESET}"
+    capture_logged doctor_out brew doctor; doctor_rc=$?
+    if (( doctor_rc != 0 )); then
+        (( QUIET == 0 )) && printf '%s\n' "$doctor_out"
+        warn "brew doctor uyarı verdi (durumu etkilemez; ayrıntı logda)"
+        doctor_note="; doctor uyarısı var"
+    fi
+
+    if (( DRY_RUN == 1 )); then
+        if (( before_count > 0 )); then module_available "$before_count paket güncellenecekti${doctor_note}"
+        else module_current "formula ve cask'ler güncel${doctor_note}"; fi
+        return 0
+    fi
+
+    brew_outdated formulas_after formula "$pinned"
+    brew_outdated casks_after cask
+    after_count=$(( $(line_count "$formulas_after") + $(line_count "$casks_after") ))
+    (( before_count > after_count )) && updated_count=$((before_count - after_count))
+
+    if (( failed == 1 )); then
+        module_partial "bazı Homebrew alt komutları başarısız; $updated_count güncellendi, $after_count kaldı"
+    elif (( after_count > 0 )); then
+        module_partial "$updated_count güncellendi, $after_count paket kaldı: $(printf '%s\n' "$formulas_after" "$casks_after" | awk 'NF' | paste -sd' ' -)"
+    elif (( updated_count > 0 )); then
+        module_updated "$updated_count paket güncellendi${doctor_note}"
+    else
+        module_current "formula ve cask'ler güncel${doctor_note}"
+    fi
+    return 0
+}
+
+# Volta ile kurulan paketler (ad@sürüm); npm outdated -g bunları görmez.
+volta_packages() {
+    have volta || return 0
+    volta list all --format plain 2>/dev/null | awk '$1=="package" {print $2}' | sort -u
+}
+
+# volta_pending SPECS — yeni sürümü olan volta paketleri: "ad<TAB>kurulu<TAB>son".
+# volta `npm update -g`'yi her pakete `npm update --global <ad>` olarak uygular
+# ve sürüm aynı olsa da paketi yeniden kurar (npm REPLACE); allowScripts
+# uyarıları her koşuda yeniden çıkar. Bu yüzden yalnız `npm view` ile yeni
+# sürümü görülen paket güncellenir. Sorgu başarısızsa son sürüm "?" yazılır ve
+# paket yine güncellenir (eski davranıştan geri kalmasın).
+volta_pending() {
+    local spec name cur latest
+    while IFS= read -r spec; do
+        [[ -z "$spec" ]] && continue
+        name="${spec%@*}"; cur="${spec##*@}"
+        capture_stdout latest npm view "$name" version || latest=""
+        latest=$(tail -n 1 <<<"$latest" | tr -d '[:space:]')
+        [[ "$latest" == "$cur" ]] && continue
+        printf '%s\t%s\t%s\n' "$name" "$cur" "${latest:-?}"
+    done <<<"${1:-}"
+}
+
+# volta_pending çıktısı → "ad kurulu → son, …"
+volta_pending_text() {
+    awk -F'\t' 'NF {printf "%s%s %s → %s", (n++ ? ", " : ""), $1, $2, $3}' <<<"${1:-}"
+}
+
+mod_node() {
+    local did=0 changed=0 rc out skip_npm=0 vname
+    local npm_before npm_after names_before names_after="" before_n=0 after_n=0 blocked_pkgs=""
+    local volta_before="" volta_after="" volta_changed="" volta_todo="" volta_n=0
+    local -a reasons=() npm_cmd=(npm update -g) failed_cmds=()
+    if have npm; then
+        did=1
+        capture_stdout npm_before npm outdated -g --json || true
+        names_before=$(npm_outdated_names "$npm_before")
+        before_n=$(line_count "$names_before")
+        names_after="$names_before"; after_n=$before_n
+        have volta && json_keys "$npm_before" | grep -qx npm && \
+            note "volta: paketlenmiş npm 'npm update -g' ile güncellenmez (gerekirse: volta install npm@latest); sayılmadı"
+        volta_before=$(volta_packages)
+        if have volta; then
+            volta_todo=$(volta_pending "$volta_before")
+            volta_n=$(line_count "$volta_todo")
+            if (( volta_n == 0 )); then
+                skip_npm=1
+                [[ -n "$volta_before" ]] && note "volta paketleri güncel, yeniden kurulmadı: $(paste -sd' ' - <<<"$volta_before")"
+            else
+                while IFS=$'\t' read -r vname _; do npm_cmd+=("$vname"); done <<<"$volta_todo"
+                note "volta paketlerinde yeni sürüm: $(volta_pending_text "$volta_todo")"
+            fi
+        fi
+
+        (( skip_npm == 0 )) && { run_capture out "${npm_cmd[@]}"; rc=$?; }
+        if (( DRY_RUN == 0 && skip_npm == 0 )); then
+            if (( QUIET == 0 )); then
+                grep -E '^(added|removed|changed|npm warn (install-scripts|allow-scripts)|npm ERR!)' <<<"$out" | tail -30 || true
+            fi
+            blocked_pkgs=$(sed -nE 's/^npm warn (allow-scripts|install-scripts)[[:space:]]+([^[:space:]]+@[^[:space:]]+) \(.*/\2/p' <<<"$out" | sort -u | paste -sd' ' -)
+            (( rc != 0 )) && { warn "npm update -g kısmi hata (rc=$rc)"; failed_cmds+=("npm update -g"); }
+            capture_stdout npm_after npm outdated -g --json || true
+            names_after=$(npm_outdated_names "$npm_after")
+            after_n=$(line_count "$names_after")
+            (( before_n > after_n )) && changed=$((before_n - after_n))
+            volta_after=$(volta_packages)
+            if [[ -n "$volta_after" ]]; then
+                if [[ -n "$volta_before" ]]; then
+                    volta_changed=$(grep -vxF -f <(printf '%s\n' "$volta_before") <<<"$volta_after" || true)
+                else
+                    volta_changed="$volta_after"
+                fi
+                if [[ -n "$volta_changed" ]]; then
+                    changed=$((changed + $(line_count "$volta_changed")))
+                    note "volta paketleri güncellendi: $(paste -sd' ' - <<<"$volta_changed")"
+                fi
+            fi
+        fi
+    fi
+    if have pnpm; then
+        did=1
+        local pnpm_ls
+        capture_stdout pnpm_ls pnpm ls -g --depth=0 || true
+        if [[ -z "$pnpm_ls" ]] || grep -q 'No global packages' <<<"$pnpm_ls"; then
+            note "pnpm: global paket yok, güncelleme atlandı"
+        else
+            run_capture out pnpm update -g; rc=$?
+            if (( rc != 0 )); then
+                if grep -q 'not in PATH' <<<"$out"; then
+                    warn "pnpm global bin dizini PATH'te değil ('pnpm setup' çalıştır)"
+                else
+                    warn "pnpm global güncelleme başarısız (rc=$rc)"
+                fi
+                failed_cmds+=("pnpm update -g")
+            fi
+        fi
+    fi
+    if have yarn; then
+        did=1
+        local yver
+        yver=$(yarn --version 2>/dev/null || echo "?")
+        if [[ "$yver" == 1.* ]]; then
+            sh_run yarn global upgrade || failed_cmds+=("yarn global upgrade")
+        else
+            note "yarn $yver: global paket kavramı yok, atlandı"
+        fi
+    fi
+    if have bun; then sh_run bun upgrade || failed_cmds+=("bun upgrade"); did=1; fi
+    (( did == 0 )) && { skip_module "node paket yöneticisi yok"; return 99; }
+
+    if (( DRY_RUN == 1 )); then
+        if (( before_n + volta_n > 0 )); then module_available "$((before_n + volta_n)) npm global paketi güncellenecekti"
+        else module_planned "npm/pnpm/bun komutları gösterildi"; fi
+        return 0
+    fi
+
+    if [[ -n "$blocked_pkgs" ]]; then
+        warn "npm allowScripts kurulum script'lerini engelledi: $blocked_pkgs — native modüller çalışmayabilir (npm approve-scripts <paket>)"
+        reasons+=("script'i engellenen: $blocked_pkgs")
+    fi
+    (( after_n > 0 )) && reasons+=("hâlâ eski: $(paste -sd' ' - <<<"$names_after")")
+    (( ${#failed_cmds[@]} > 0 )) && reasons+=("başarısız: $(join_list "${failed_cmds[@]}")")
+
+    if (( ${#reasons[@]} > 0 )); then
+        local joined
+        joined=$(printf '%s; ' "${reasons[@]}"); joined="${joined%; }"
+        module_partial "$changed paket güncellendi; $joined"
+    elif (( changed > 0 )); then
+        module_updated "$changed global paket güncellendi"
+    else
+        module_current "global Node paketleri güncel"
+    fi
+    return 0
+}
+
+# Yalnız izole araç yöneticileri güncellenir (pipx, uv tool, poetry self).
+# pip3 / brew Python / conda'ya dokunulmaz (PEP 668, kullanıcı kuralı).
+mod_python() {
+    local did=0 changed=0 out rc
+    local -a failed_cmds=()
+    if have pipx; then
+        did=1
+        run_capture out pipx upgrade-all; rc=$?
+        if (( QUIET == 0 )) && [[ -n "$out" ]]; then
+            grep -E '^(upgraded package|No packages upgraded|upgrading )' <<<"$out" | tail -30 || true
+        fi
+        changed=$((changed + $(grep -c '^upgraded package ' <<<"$out" || true)))
+        (( rc != 0 )) && failed_cmds+=("pipx upgrade-all")
+    fi
+    if have uv; then
+        did=1
+        local tools
+        capture_stdout tools uv tool list || true
+        if grep -qE '^[^-[:space:]]' <<<"$tools" && ! grep -q '^No tools installed' <<<"$tools"; then
+            run_capture out uv tool upgrade --all; rc=$?
+            (( QUIET == 0 )) && [[ -n "$out" ]] && printf '%s\n' "$out"
+            changed=$((changed + $(grep -c '^Updated ' <<<"$out" || true)))
+            (( rc != 0 )) && failed_cmds+=("uv tool upgrade --all")
+        else
+            note "uv tool ile kurulu araç yok"
+        fi
+    fi
+    if have poetry; then
+        did=1
+        sh_run poetry self update || { warn "poetry self-update başarısız"; failed_cmds+=("poetry self update"); }
+    fi
+    if have conda; then
+        note "conda'ya dokunulmadı (yalnız rapor): $(conda --version 2>/dev/null || echo '?')"
+    fi
+    if (( AGGRESSIVE_CLEAN == 1 )) && have pip3; then
+        sh_run pip3 cache purge || true
+    fi
+    (( did == 0 )) && { skip_module "izole Python araç yöneticisi yok (pipx/uv/poetry)"; return 99; }
+
+    if (( DRY_RUN == 1 )); then module_planned "pipx/uv tool/poetry komutları gösterildi"; return 0; fi
+    if (( ${#failed_cmds[@]} > 0 )); then module_partial "$changed araç güncellendi; başarısız: $(join_list "${failed_cmds[@]}")"
+    elif (( changed > 0 )); then module_updated "$changed araç güncellendi"
+    else module_current "yönetilen Python araçları güncel"; fi
+    return 0
+}
+
+mod_rust() {
+    have rustup || { skip_module "rustup yok"; return 99; }
+    local out changed=0 rc
+    local -a failed_cmds=()
+    run_capture out rustup update; rc=$?
+    (( QUIET == 0 )) && [[ -n "$out" ]] && printf '%s\n' "$out"
+    grep -qE ' updated - rustc|installed - rustc' <<<"$out" && changed=$((changed+1))
+    (( rc != 0 )) && failed_cmds+=("rustup update")
+    # auto-self-update açıksa rustup update kendini zaten denetler
+    grep -q 'checking for self-update' <<<"$out" || sh_run rustup self update || true
+    if have cargo && cargo install-update --version >/dev/null 2>&1; then
+        run_capture out cargo install-update -a; rc=$?
+        (( QUIET == 0 )) && [[ -n "$out" ]] && printf '%s\n' "$out"
+        grep -q 'Overall updated [1-9]' <<<"$out" && changed=$((changed+1))
+        (( rc != 0 )) && failed_cmds+=("cargo install-update -a")
+    else
+        note "cargo-update yok (cargo install cargo-update)"
+    fi
+    if (( DRY_RUN == 1 )); then module_planned "rustup/cargo komutları gösterildi"; return 0; fi
+    if (( ${#failed_cmds[@]} > 0 )); then module_partial "başarısız: $(join_list "${failed_cmds[@]}")"
+    elif (( changed > 0 )); then module_updated "toolchain veya cargo paketleri güncellendi"
+    else module_current "Rust toolchain ve cargo paketleri güncel"; fi
+    return 0
+}
+
+ruby_permission_problem() {
+    local gem_bin="$1" gemdir plugin_dir p
+    gemdir=$(env -u GEM_HOME -u GEM_PATH "$gem_bin" env gemdir 2>/dev/null) || return 1
+    plugin_dir="$gemdir/plugins"
+    [[ -d "$plugin_dir" ]] || return 1
+    [[ -w "$plugin_dir" ]] || { printf '%s (dizin yazılamıyor)' "$plugin_dir"; return 0; }
+    # RubyGems plugin dosyalarını yeniden yazar; symlink ise hedefine yazar.
+    # Brew Ruby'de hedef Cellar'daki salt-okunur dosya olabilir (EACCES).
+    while IFS= read -r -d '' p; do
+        [[ -w "$p" ]] && continue
+        if [[ -L "$p" ]]; then
+            printf '%s → %s (symlink hedefi salt-okunur)' "$p" "$(readlink "$p")"
+        else
+            printf '%s (dosya yazılamıyor)' "$p"
+        fi
+        return 0
+    done < <(find "$plugin_dir" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+    return 1
+}
+
+ruby_gem_bin() {
+    local prefix
+    if have brew; then
+        prefix=$(brew --prefix ruby 2>/dev/null)
+        [[ -n "$prefix" && -x "$prefix/bin/gem" ]] && { printf '%s' "$prefix/bin/gem"; return 0; }
+    fi
+    have gem && { printf 'gem'; return 0; }
+    return 1
+}
+
+# Ruby ile gelen gem adları: varsayılan gem'ler ve Ruby'nin kendi gem dizinindeki
+# bundled gem'ler (Gem.dir/Gem.user_dir dışı; brew'da Cellar). Bunlar `brew
+# upgrade ruby` ile gelir; gem update'e verilince io-wait 1.0.0 (yalnız
+# deprecation uyarısı basan sürüm) ve rdoc 7+8 çift yüklemesi oluşmuştu.
+ruby_shipped_gems() {
+    local gem_bin="$1" ruby_bin=ruby
+    [[ "$gem_bin" == */* ]] && ruby_bin="${gem_bin%/*}/ruby"
+    env -u GEM_HOME -u GEM_PATH "$ruby_bin" -e \
+        'puts Gem::Specification.select { |s| s.default_gem? || ![Gem.dir, Gem.user_dir].include?(s.base_dir) }.map(&:name).uniq' 2>/dev/null
+}
+
+mod_ruby() {
+    local gem_bin gemdir bad before after changed=0 rc before_n after_n shipped targets skipped
+    local -a failed_cmds=() update_args=()
+    gem_bin=$(ruby_gem_bin) || { skip_module "gem yok"; return 99; }
+    gemdir=$(env -u GEM_HOME -u GEM_PATH "$gem_bin" env gemdir 2>/dev/null)
+    if [[ "$gemdir" == /usr/* || "$gemdir" == /System/* || "$gemdir" == /Library/* || ! -w "$gemdir" ]]; then
+        skip_module "Ruby gem dizini yazılamıyor: $gemdir"; return 99
+    fi
+    if bad=$(ruby_permission_problem "$gem_bin"); then
+        warn "Ruby plugin yolu yazılamıyor: $bad — sudo/chown yapılmadı; symlink ise hedefin yazılabilir bir kopyasıyla değiştir"
+        module_partial "gem update çalıştırılmadı: $bad"
+        return 0
+    fi
+
+    # Sayım yalnız stdout'tan: çift yüklenen rdoc vb. stderr uyarıları sayılmaz.
+    # Ruby ile gelen gem'ler ne güncellenir ne de "hâlâ eski" sayılır.
+    capture_stdout before env -u GEM_HOME -u GEM_PATH "$gem_bin" outdated || true
+    shipped=$(ruby_shipped_gems "$gem_bin" || true)
+    targets=$(gem_user_outdated "$before" "$shipped")
+    skipped=$(gem_outdated_names "$before" | grep -xF -f <(printf '%s\n' "$shipped") || true)
+    before_n=$(line_count "$targets")
+    if [[ -n "$skipped" ]]; then
+        note "Ruby ile gelen $(line_count "$skipped") gem atlandı (brew upgrade ruby ile gelir; adlar logda)"
+        printf 'Ruby ile gelen, atlanan gem: %s\n' "$(paste -sd' ' - <<<"$skipped")" >>"$LOG_FILE"
+    fi
+    sh_run_quiet '^(Successfully installed|Gems updated|RubyGems .+ installed|Latest version|ERROR)' \
+        env -u GEM_HOME -u GEM_PATH "$gem_bin" update --system --no-document
+    rc=$?; (( rc != 0 )) && failed_cmds+=("gem update --system")
+    if [[ -n "$targets" ]]; then
+        mapfile -t update_args <<<"$targets"
+        sh_run_quiet '^(Successfully installed|Gems updated|ERROR)' \
+            env -u GEM_HOME -u GEM_PATH "$gem_bin" update --no-document "${update_args[@]}"
+        rc=$?; (( rc != 0 )) && failed_cmds+=("gem update")
+    fi
+    sh_run_quiet '^(Successfully uninstalled|Clean up complete|ERROR)' \
+        env -u GEM_HOME -u GEM_PATH "$gem_bin" cleanup
+    rc=$?; (( rc != 0 )) && failed_cmds+=("gem cleanup")
+
+    if (( DRY_RUN == 1 )); then
+        if (( before_n > 0 )); then module_available "$before_n gem güncellenecekti"
+        else module_current "RubyGems ve gem'ler güncel"; fi
+        return 0
+    fi
+
+    capture_stdout after env -u GEM_HOME -u GEM_PATH "$gem_bin" outdated || true
+    after_n=$(line_count "$(gem_user_outdated "$after" "$shipped")")
+    changed=$(( before_n - after_n ))
+    (( changed < 0 )) && changed=0
+    if (( ${#failed_cmds[@]} > 0 )); then module_partial "$changed gem güncellendi; başarısız: $(join_list "${failed_cmds[@]}")"
+    elif (( after_n > 0 )); then module_partial "$changed gem güncellendi; $after_n gem hâlâ eski"
+    elif (( changed > 0 )); then module_updated "$changed gem güncellendi"
+    else module_current "RubyGems ve gem'ler güncel"; fi
+    return 0
+}
+
+mod_go() {
+    have go || { skip_module "go yok"; return 99; }
+    (( GO_CLEAN == 0 )) && { skip_module "Go cache temizliği isteğe bağlı (--go-clean)"; return 99; }
+    sh_run go clean -cache || { module_failed "go build cache temizlenemedi"; return 1; }
+    if (( AGGRESSIVE_CLEAN == 1 )); then sh_run go clean -modcache || true; fi
+    module_completed "Go cache temizlendi"
+}
+
+mod_docker() {
+    [[ $SKIP_DOCKER -eq 1 ]] && { skip_module "--skip-docker"; return 99; }
+    (( DOCKER_PRUNE == 0 )) && { skip_module "Docker prune isteğe bağlı (--docker-prune)"; return 99; }
+    have docker || { skip_module "docker yok"; return 99; }
+    docker info >/dev/null 2>&1 || { skip_module "Docker daemon kapalı"; return 99; }
+    sh_run docker system df || true
+    local args=(system prune -af) failed=0
+    if (( DOCKER_PRUNE_VOLUMES == 1 )); then
+        warn "Docker volume temizliği kalıcı verileri silebilir"
+        confirm "Kullanılmayan volume'ler de silinsin mi?" "N" || { skip_module "Volume prune yapılmadı — $CONFIRM_WHY"; return 99; }
+        args+=(--volumes)
+    fi
+    sh_run docker "${args[@]}" || failed=1
+    if docker buildx version >/dev/null 2>&1; then sh_run docker builder prune -af || failed=1
+    else note "docker buildx bulunamadı; builder prune atlandı"; fi
+    if (( failed == 1 )); then module_partial "bazı Docker temizlikleri başarısız"
+    else module_completed "kullanılmayan Docker verileri temizlendi"; fi
+    return 0
+}
+
+# Bakım (--maintenance): paket yöneticisi cache'lerinin güvenli bakımı.
+mod_cache() {
+    [[ $SKIP_CACHE -eq 1 ]] && { skip_module "--skip-cache"; return 99; }
+    (( RUN_MAINTENANCE == 0 )) && { skip_module "Bakım isteğe bağlı (--maintenance)"; return 99; }
+    local before after uv_rc=0
+    before=$(disk_used_kb "$HOME/Library/Caches/Homebrew")
+    info "Güvenli kullanıcı cache bakımı"
+    if have npm; then sh_run npm cache verify || true; fi
+    if have uv; then
+        # Çalışan uv süreçleri (ör. uvx ile açılmış MCP sunucuları) cache
+        # kilidini tutar; prune o zaman zaman aşımına kadar boşuna bekler.
+        local uv_busy
+        uv_busy=$(pgrep -x uv 2>/dev/null | wc -l | tr -d ' ')
+        if (( uv_busy > 0 )); then
+            note "uv cache prune atlandı: $uv_busy uv süreci çalışıyor (uvx ile açık MCP sunucuları cache kilidini tutar)"
+        else
+            run_with_timeout "$UV_PRUNE_TIMEOUT" uv cache prune || uv_rc=$?
+            if (( uv_rc == 124 )); then
+                warn "uv cache prune ${UV_PRUNE_TIMEOUT} sn'de bitmedi, zaman aşımı (başka bir uv süreci cache kilidini tutuyor olabilir); atlandı"
+            elif (( uv_rc != 0 )); then
+                warn "uv cache prune başarısız (rc=$uv_rc)"
+            fi
+        fi
+    fi
+    if have pnpm; then sh_run pnpm store prune || true; fi
+    if have brew; then sh_run brew cleanup || true; fi
+    if (( XCODE_CLEAN == 1 && SKIP_XCODE == 0 )); then
+        note "Xcode DerivedData ve kullanılamayan simülatörler temizleniyor; Archives korunur"
+        safe_rm "$HOME/Library/Developer/Xcode/DerivedData"/*
+        safe_rm "$HOME/Library/Developer/CoreSimulator/Caches"/*
+        if have xcrun && xcrun -f simctl >/dev/null 2>&1; then sh_run xcrun simctl delete unavailable || true; fi
+    fi
+    if (( AGGRESSIVE_CLEAN == 1 )); then
+        warn "Agresif temizlik etkin; yalnız bilinen cache yolları silinecek"
+        if have yarn; then sh_run yarn cache clean || true; fi
+        safe_rm "$HOME/Library/Caches/com.apple.dt.Xcode"
+        safe_rm "$HOME/Library/Caches/org.swift.swiftpm"
+        safe_rm "$HOME/Library/Logs/Homebrew"
+    fi
+    after=$(disk_used_kb "$HOME/Library/Caches/Homebrew")
+    note "Homebrew cache: $(human_kb "$before") → $(human_kb "$after")"
+    if (( after < before )); then module_updated "$(human_kb $((before-after))) temizlendi"
+    else module_completed "cache bakımı tamam"; fi
+    return 0
+}
+
+# brew services list: yalnız "none" olmayan satırlar gösterilir, "error"
+# durumundaki servisler uyarılır (KeepAlive'lı LaunchAgent çökme döngüsünde
+# kalabilir). Özet BREW_SVC_DETAIL'e yazılır.
+brew_services_check() {
+    local out rc failed running
+    log "${DIM}\$ brew services list${RESET}"
+    capture_stdout out brew services list; rc=$?
+    (( rc != 0 )) && return "$rc"
+    if (( QUIET == 0 )) && awk 'NR>1 && $2!="none" {f=1} END {exit !f}' <<<"$out"; then
+        awk 'NR==1 || $2!="none"' <<<"$out"
+    fi
+    failed=$(awk 'NR>1 && $2=="error" {print $1}' <<<"$out" | paste -sd' ' -)
+    running=$(awk 'NR>1 && $2=="started" {print $1}' <<<"$out" | paste -sd' ' -)
+    [[ -n "$failed" ]] && warn "brew servisi hata durumunda: $failed — ayrıntı: brew services info <ad>; gerekmiyorsa: brew services stop <ad>"
+    BREW_SVC_DETAIL="çalışan: ${running:-yok}${failed:+; hatalı: $failed}"
+    return 0
+}
+
+mod_brew_services() {
+    have brew || { skip_module "brew yok"; return 99; }
+    brew_services_check || { module_partial "servis listesi alınamadı"; return 0; }
+    module_completed "$BREW_SVC_DETAIL"
+}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# EXTENDED
+# ═════════════════════════════════════════════════════════════════════
+
+mod_deno() {
+    have deno || { skip_module "deno yok"; return 99; }
+    sh_run deno upgrade || true
+}
+
+mod_flutter() {
+    have flutter || { skip_module "flutter yok"; return 99; }
+    sh_run flutter upgrade
+    sh_run flutter doctor --suppress-analytics || true
+    have dart && sh_run dart pub global list || true
+}
+
+mod_haskell() {
+    have ghcup || { skip_module "ghcup yok"; return 99; }
+    sh_run ghcup upgrade || true
+    have cabal && sh_run cabal update || true
+}
+
+mod_composer() {
+    have composer || { skip_module "composer yok"; return 99; }
+    sh_run composer self-update || true
+    sh_run composer global update || true
+    if (( AGGRESSIVE_CLEAN == 1 )); then sh_run composer clear-cache || true; fi
+}
+
+mod_asdf() {
+    have asdf || { skip_module "asdf yok"; return 99; }
+    sh_run asdf plugin update --all || true
+    note "Dil sürümleri elle: asdf install <plugin> latest"
+}
+
+mod_mise() {
+    have mise || { skip_module "mise yok"; return 99; }
+    local -a failed_cmds=()
+    # brew'le kurulu mise kendini güncelleyemez; onu brew upgrade günceller
+    if [[ "$(resolve_path "$(command -v mise)")" == /opt/homebrew/* ]]; then
+        note "mise brew ile kurulu; self-update yerine brew upgrade günceller"
+    else
+        sh_run mise self-update -y || failed_cmds+=("mise self-update")
+    fi
+    sh_run mise upgrade || failed_cmds+=("mise upgrade")
+    sh_run mise plugin update || failed_cmds+=("mise plugin update")
+    if (( ${#failed_cmds[@]} )); then module_partial "başarısız: $(join_list "${failed_cmds[@]}")"
+    else module_completed "self-update, upgrade ve plugin update tamam"; fi
+}
+
+mod_swift() {
+    have swift || { skip_module "swift yok"; return 99; }
+    (( AGGRESSIVE_CLEAN == 0 )) && { skip_module "SwiftPM cache silme yalnız --aggressive-clean ile"; return 99; }
+    note "Swift package cache temizleniyor"
+    safe_rm "$HOME/Library/Caches/org.swift.swiftpm"
+}
+
+mod_gcloud() {
+    have gcloud || { skip_module "gcloud yok"; return 99; }
+    sh_run gcloud components update --quiet || warn "gcloud update başarısız"
+}
+
+# AWS CLI'yı macupdate güncellemez; çalışıp çalışmadığını ve nasıl kurulduğunu
+# raporlar (brew awscli → brew upgrade; AWS pkg → AWS'nin yükleyicisi).
+mod_aws() {
+    have aws || { skip_module "aws yok"; return 99; }
+    local out rc path why
+    path=$(command -v aws)
+    log "${DIM}\$ aws --version${RESET}"
+    capture_logged out aws --version; rc=$?
+    if (( rc != 0 )); then
+        why="rc=$rc"
+        grep -q 'Bad CPU type' <<<"$out" && why="x86_64 ikili, Rosetta yok"
+        warn "AWS CLI çalışmıyor ($path: $why) — Apple Silicon için: brew install awscli"
+        module_partial "aws çalışmıyor: $why"
+        return 0
+    fi
+    (( QUIET == 0 )) && printf '%s\n' "$out"
+    if have brew && brew list --formula awscli >/dev/null 2>&1; then
+        module_current "brew upgrade ile güncellenir: ${out%% *}"
+    else
+        module_current "brew dışı kurulum ($path), macupdate güncellemez: ${out%% *}"
+    fi
+}
+
+mod_azcli() {
+    have az || { skip_module "az yok"; return 99; }
+    sh_run az upgrade --yes || warn "az upgrade başarısız"
+}
+
+mod_heroku() {
+    have heroku || { skip_module "heroku yok"; return 99; }
+    sh_run heroku update || true
+}
+
+mod_dotnet() {
+    have dotnet || { skip_module "dotnet yok"; return 99; }
+    sh_run dotnet --version
+    # Global tool'ları listele ve güncelle
+    local tools
+    tools=$(dotnet tool list -g 2>/dev/null | tail -n +3 | awk '{print $1}' | grep -v '^$' || true)
+    if [[ -z "$tools" ]]; then
+        note "dotnet: global tool yok"
+        return 0
+    fi
+    for t in $tools; do
+        sh_run dotnet tool update -g "$t" || warn "dotnet tool $t güncellenemedi"
+    done
+}
+
+# pyenv: pyenv-update eklentisi varsa o (kök + eklentiler), yoksa git ile
+# kurulmuş kök; ikisi de yoksa brew kurulumudur ve brew upgrade günceller.
+mod_pyenv() {
+    have pyenv || { skip_module "pyenv yok"; return 99; }
+    local root
+    if pyenv commands 2>/dev/null | grep -qx update; then
+        sh_run pyenv update || { module_partial "başarısız: pyenv update"; return 0; }
+        module_completed "pyenv update tamam"
+        return 0
+    fi
+    root=$(pyenv root 2>/dev/null)
+    if [[ -n "$root" && -d "$root/.git" ]]; then
+        sh_run git -C "$root" pull --ff-only || { module_partial "başarısız: git pull ($root)"; return 0; }
+        module_completed "pyenv git deposu güncellendi"
+        return 0
+    fi
+    skip_module "pyenv update eklentisi yok; brew kurulumunu brew upgrade günceller"
+    return 99
+}
+
+mod_krew() {
+    have kubectl || { skip_module "kubectl yok"; return 99; }
+    kubectl krew version >/dev/null 2>&1 || { skip_module "krew yok"; return 99; }
+    sh_run kubectl krew upgrade
+}
+
+mod_helm() {
+    have helm || { skip_module "helm yok"; return 99; }
+    local plugins
+    plugins=$(helm plugin list 2>/dev/null | tail -n +2 | awk '{print $1}')
+    for p in $plugins; do
+        sh_run helm plugin update "$p" || warn "helm plugin $p başarısız"
+    done
+    sh_run helm repo update || true
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# EDITORS
+# ═════════════════════════════════════════════════════════════════════
+
+mod_vscode() {
+    have code || { skip_module "VS Code CLI (code) yok"; return 99; }
+    # Cursor kendi `code` komutunu da kurabilir; aynı eklentiler iki kez kurulmasın
+    if [[ "$(resolve_path "$(command -v code)")" == */Cursor.app/* ]]; then
+        skip_module "code komutu Cursor'a ait; eklentileri cursor modülü günceller"
+        return 99
+    fi
+    local exts count
+    exts=$(code --list-extensions 2>/dev/null)
+    count=$(echo "$exts" | wc -l | tr -d ' ')
+    info "VS Code: $count extension"
+    for ext in $exts; do
+        log "${DIM}\$ code --install-extension $ext --force${RESET}"
+        if [[ $DRY_RUN -eq 0 ]]; then
+            code --install-extension "$ext" --force >/dev/null 2>&1 || warn "VS Code: $ext güncellenemedi"
+        fi
+    done
+}
+
+mod_cursor() {
+    have cursor || { skip_module "Cursor CLI yok"; return 99; }
+    local exts count
+    exts=$(cursor --list-extensions 2>/dev/null)
+    count=$(echo "$exts" | wc -l | tr -d ' ')
+    info "Cursor: $count extension"
+    for ext in $exts; do
+        log "${DIM}\$ cursor --install-extension $ext --force${RESET}"
+        if [[ $DRY_RUN -eq 0 ]]; then
+            cursor --install-extension "$ext" --force >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+mod_vscode_insiders() {
+    have code-insiders || { skip_module "code-insiders yok"; return 99; }
+    local exts count
+    exts=$(code-insiders --list-extensions 2>/dev/null)
+    count=$(echo "$exts" | wc -l | tr -d ' ')
+    info "VS Code Insiders: $count extension"
+    for ext in $exts; do
+        log "${DIM}\$ code-insiders --install-extension $ext --force${RESET}"
+        if [[ $DRY_RUN -eq 0 ]]; then
+            code-insiders --install-extension "$ext" --force >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+mod_windsurf() {
+    have windsurf || { skip_module "windsurf CLI yok"; return 99; }
+    local exts count
+    exts=$(windsurf --list-extensions 2>/dev/null)
+    count=$(echo "$exts" | wc -l | tr -d ' ')
+    info "Windsurf: $count extension"
+    for ext in $exts; do
+        log "${DIM}\$ windsurf --install-extension $ext --force${RESET}"
+        if [[ $DRY_RUN -eq 0 ]]; then
+            windsurf --install-extension "$ext" --force >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+mod_neovim() {
+    have nvim || { skip_module "nvim yok"; return 99; }
+
+    if [[ -d "$HOME/.local/share/nvim/lazy" ]]; then
+        note "lazy.nvim tespit"
+        sh_run nvim --headless "+Lazy! sync" +qa || warn "lazy sync başarısız"
+    elif [[ -d "$HOME/.local/share/nvim/site/pack/packer" ]]; then
+        note "packer.nvim tespit"
+        sh_run nvim --headless "+autocmd User PackerComplete qa" +PackerSync || true
+    elif [[ -f "$HOME/.local/share/nvim/site/autoload/plug.vim" ]]; then
+        note "vim-plug tespit"
+        sh_run nvim --headless +PlugUpdate +qa || true
+    else
+        note "Plugin manager tespit edilemedi"
+    fi
+
+    [[ -d "$HOME/.local/share/nvim/mason" ]] && \
+        sh_run nvim --headless "+MasonUpdate" +qa || true
+    sh_run nvim --headless "+TSUpdateSync" +qa 2>/dev/null || true
+}
+
+mod_tmux() {
+    [[ -d "$HOME/.tmux/plugins/tpm" ]] || { skip_module "tpm yok"; return 99; }
+    sh_run "$HOME/.tmux/plugins/tpm/bin/update_plugins" all
+}
+
+# oh-my-zsh + custom eklenti/tema depoları. Ekrana yalnız sonuç satırları
+# ("+N commit"); banner ve git çıktısı loga. Eklenti hook'ları çalıştırılmaz.
+mod_omz() {
+    [[ -d "$HOME/.oh-my-zsh" ]] || { skip_module "oh-my-zsh yok"; return 99; }
+    local out d name before after n
+    local -a failed_cmds=() updated=()
+    run_capture out env DISABLE_UPDATE_PROMPT=true "$HOME/.oh-my-zsh/tools/upgrade.sh" \
+        || failed_cmds+=("omz upgrade")
+    if (( QUIET == 0 )) && [[ -n "$out" ]]; then
+        grep -iE 'has been updated|already at the latest|error|fail' <<<"$out" | head -3 || true
+    fi
+    grep -qi 'has been updated' <<<"$out" && updated+=("oh-my-zsh")
+
+    for d in "$HOME/.oh-my-zsh/custom/plugins"/* "$HOME/.oh-my-zsh/custom/themes"/*; do
+        [[ -d "$d/.git" ]] || continue
+        name=$(basename "$d")
+        if (( DRY_RUN == 1 )); then log "${DIM}\$ git -C $d pull --ff-only${RESET}"; continue; fi
+        before=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+        if GIT_TERMINAL_PROMPT=0 git -C "$d" -c core.hooksPath=/dev/null pull --ff-only --quiet >>"$LOG_FILE" 2>&1; then
+            after=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+            if [[ "$before" != "$after" ]]; then
+                n=$(git -C "$d" rev-list --count "$before..$after" 2>/dev/null || echo "?")
+                log "  ${GREEN}↑${RESET} $name +$n commit"
+                updated+=("$name")
+            fi
+        else
+            log "  ${RED}✗${RESET} $name: git pull --ff-only başarısız (ayrıntı logda)"
+            failed_cmds+=("git pull $name")
+        fi
+    done
+
+    (( DRY_RUN == 1 )) && { module_planned "omz ve eklenti güncellemeleri gösterildi"; return 0; }
+    if (( ${#failed_cmds[@]} )); then module_partial "başarısız: $(join_list "${failed_cmds[@]}")"
+    elif (( ${#updated[@]} )); then module_updated "güncellendi: $(join_list "${updated[@]}")"
+    else module_current "oh-my-zsh ve eklentiler güncel"; fi
+}
+
+mod_fzf() {
+    [[ -d "$HOME/.fzf" ]] || { skip_module "fzf git install'u yok (brew ile yönetiliyor)"; return 99; }
+    sh_run git -C "$HOME/.fzf" pull --ff-only || { module_partial "fzf git pull başarısız"; return 0; }
+    sh_run bash -c 'cd "$1" && ./install --bin' _ "$HOME/.fzf" || { module_partial "fzf install başarısız"; return 0; }
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# DEEP CLEAN
+# ═════════════════════════════════════════════════════════════════════
+
+# Verilen cache yollarının İÇERİĞİNİ siler. Önce boyutları listeler; dry-run'da
+# yalnız gösterir, aksi halde onay ister (tty yoksa --yes olmadan silmez).
+clean_cache_paths() {
+    local label="$1"; shift
+    local -a hits=()
+    local p kb total_before=0 total_after=0
+    for p in "$@"; do
+        [[ -e "$p" ]] || continue
+        kb=$(disk_used_kb "$p")
+        hits+=("$p")
+        total_before=$((total_before + kb))
+        log "  $(human_kb "$kb")\t$p"
+    done
+    (( ${#hits[@]} == 0 )) && { skip_module "$label: temizlenecek yol yok"; return 99; }
+    if (( DRY_RUN == 1 )); then
+        for p in "${hits[@]}"; do log "${DIM}\$ rm -rf \"$p\"/*${RESET}"; done
+        module_planned "~$(human_kb "$total_before") silinecekti (${#hits[@]} yol)"
+        return 0
+    fi
+    confirm "$label: ${#hits[@]} yolun içeriği (~$(human_kb "$total_before")) silinsin mi?" "N" \
+        || { skip_module "$label: silinmedi — $CONFIRM_WHY"; return 99; }
+    for p in "${hits[@]}"; do
+        log "${DIM}\$ rm -rf \"$p\"/*${RESET}"
+        rm -rf "${p:?}"/* 2>/dev/null || true
+        total_after=$((total_after + $(disk_used_kb "$p")))
+    done
+    module_updated "$(human_kb "$total_before") → $(human_kb "$total_after") (kurtarılan: $(human_kb $((total_before - total_after))))"
+    return 0
+}
+
+mod_browser_cache() {
+    info "Tarayıcı cache'leri (sadece Cache; profil/cookie korunur)"
+    local -a paths=(
+        "$HOME/Library/Caches/com.apple.Safari"
+        "$HOME/Library/Safari/Favicon Cache"
+        "$HOME/Library/Application Support/Google/Chrome/Default/Cache"
+        "$HOME/Library/Application Support/Google/Chrome/Default/Code Cache"
+        "$HOME/Library/Caches/Google/Chrome"
+        "$HOME/Library/Application Support/Google/Chrome Canary/Default/Cache"
+        "$HOME/Library/Application Support/Arc/User Data/Default/Cache"
+        "$HOME/Library/Caches/company.thebrowser.Browser"
+        "$HOME/Library/Application Support/BraveSoftware/Brave-Browser/Default/Cache"
+        "$HOME/Library/Caches/BraveSoftware"
+        "$HOME/Library/Application Support/Microsoft Edge/Default/Cache"
+        "$HOME/Library/Caches/com.microsoft.edgemac"
+        "$HOME/Library/Caches/Firefox"
+    )
+    local d
+    # Firefox cache2 — profil altında aranır
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && paths+=("$d")
+    done < <(find "$HOME/Library/Application Support/Firefox/Profiles" -maxdepth 2 -name cache2 -type d 2>/dev/null)
+    clean_cache_paths "Tarayıcı cache" "${paths[@]}"
+}
+
+mod_app_cache() {
+    info "Uygulama cache'leri"
+    local -a paths=(
+        "$HOME/Library/Application Support/Slack/Cache"
+        "$HOME/Library/Application Support/Slack/Code Cache"
+        "$HOME/Library/Application Support/Slack/GPUCache"
+        "$HOME/Library/Application Support/discord/Cache"
+        "$HOME/Library/Application Support/discord/Code Cache"
+        "$HOME/Library/Application Support/discord/GPUCache"
+        "$HOME/Library/Application Support/Microsoft/Teams/Cache"
+        "$HOME/Library/Application Support/zoom.us/AutoDownload"
+        "$HOME/Library/Caches/us.zoom.xos"
+        "$HOME/Library/Application Support/Spotify/PersistentCache"
+        "$HOME/Library/Caches/com.spotify.client"
+        "$HOME/Library/Application Support/Code/Cache"
+        "$HOME/Library/Application Support/Code/CachedData"
+        "$HOME/Library/Application Support/Cursor/Cache"
+        "$HOME/Library/Application Support/Cursor/CachedData"
+        "$HOME/Dropbox/.dropbox.cache"
+        "$HOME/Library/Caches/Adobe"
+        "$HOME/Library/Application Support/Adobe/Common/Media Cache"
+        "$HOME/Library/Application Support/Adobe/Common/Media Cache Files"
+        "$HOME/Library/Caches/JetBrains"
+        # Xcode CodingAssistant bilerek yok: Agents/* indirilmiş ajanlar,
+        # codex/ ve ClaudeAgentConfig/ ajanların ayar/oturum dizinleri; cache değil.
+    )
+    clean_cache_paths "Uygulama cache" "${paths[@]}"
+}
+
+mod_mail_downloads() {
+    local mail_dir="$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
+    [[ ! -d "$mail_dir" ]] && { skip_module "Mail downloads yok"; return 99; }
+    local kb; kb=$(disk_used_kb "$mail_dir")
+    (( kb == 0 )) && { skip_module "Mail downloads boş"; return 99; }
+
+    info "Mail indirmeleri: $(human_kb $kb)"
+    confirm "Mail indirmeleri (~$(human_kb $kb)) silinsin mi?" "N" \
+        || { skip_module "Mail indirmeleri silinmedi — $CONFIRM_WHY"; return 99; }
+    safe_rm "$mail_dir"/*
+    module_completed "Mail indirmeleri temizlendi (~$(human_kb $kb))"
+}
+
+mod_ios_backups() {
+    local backup_dir="$HOME/Library/Application Support/MobileSync/Backup"
+    [[ ! -d "$backup_dir" ]] && { skip_module "iOS backup yok"; return 99; }
+    local kb; kb=$(disk_used_kb "$backup_dir")
+    (( kb == 0 )) && { skip_module "iOS backup boş"; return 99; }
+
+    info "iOS yedekleri: $(human_kb $kb) (otomatik silinmiyor)"
+    local listing
+    listing=$(find "$backup_dir" -maxdepth 1 -mindepth 1 -type d -exec ls -lad {} + 2>/dev/null || true)
+    [[ -n "$listing" ]] && log "$listing"
+    note "Manuel: Finder Cmd+Shift+G → $backup_dir"
+}
+
+mod_system_logs() {
+    [[ $AGGRESSIVE_CLEAN -eq 0 ]] && { skip_module "Sistem log temizliği yalnız --aggressive-clean ile"; return 99; }
+    info "Eski sıkıştırılmış sistem logları temizleniyor"
+    sh_run sudo find /var/log -type f -name '*.gz' -mtime +30 -delete || true
+    sh_run sudo find /Library/Logs/DiagnosticReports -type f -mtime +30 -delete || true
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# AUDIT — Sistem denetimi (sadece rapor, hiçbir şey değiştirmez)
+# ═════════════════════════════════════════════════════════════════════
+
+mod_audit_unmanaged() {
+    info "Brew cask ve App Store dışında kalan /Applications uygulamaları"
+    info "(bunlar manuel güncellenmek zorunda)"
+
+    local apps_dir="/Applications"
+    [[ ! -d "$apps_dir" ]] && { skip_module "/Applications yok"; return 99; }
+
+    # Cask ile yönetilen app adlarını topla
+    local -a cask_apps=()
+    if have brew; then
+        while IFS= read -r cask; do
+            # brew info --json cask → App[].name
+            local names
+            names=$(brew info --json=v2 --cask "$cask" 2>/dev/null | \
+                    python3 -c "import sys, json; d=json.load(sys.stdin); [print(a) for c in d['casks'] for a in c.get('artifacts',[]) for a in (a.get('app',[]) if isinstance(a,dict) else [])]" 2>/dev/null || true)
+            while IFS= read -r n; do [[ -n "$n" ]] && cask_apps+=("$n"); done <<< "$names"
+        done < <(brew list --cask 2>/dev/null)
+    fi
+
+    # App Store (mas) tarafından yönetilenler
+    local -a mas_apps=()
+    if have mas; then
+        while IFS= read -r line; do
+            # Format: "ID AppName (version)" — ad middle kısım
+            local name; name=$(echo "$line" | sed -E 's/^[0-9]+ +//' | sed -E 's/ +\([0-9.]+\)$//')
+            [[ -n "$name" ]] && mas_apps+=("${name}.app")
+        done < <(mas list 2>/dev/null)
+    fi
+
+    # /Applications altındaki tüm .app'leri tara
+    local count=0
+    log "\n${BOLD}Manuel yönetim gerektirenler:${RESET}"
+    while IFS= read -r app; do
+        local name; name=$(basename "$app")
+        # Cask veya mas listesinde var mı?
+        local managed=0
+        for ca in "${cask_apps[@]}"; do [[ "$ca" == "$name" ]] && { managed=1; break; }; done
+        [[ $managed -eq 0 ]] && for ma in "${mas_apps[@]}"; do [[ "$ma" == "$name" ]] && { managed=1; break; }; done
+
+        if [[ $managed -eq 0 ]]; then
+            local size; size=$(du -sh "$app" 2>/dev/null | awk '{print $1}')
+            log "  ${YELLOW}●${RESET} $name (${size:-?})"
+            ((count++))
+        fi
+    done < <(find "$apps_dir" -maxdepth 1 -name "*.app" -type d 2>/dev/null | sort)
+
+    note "Toplam $count uygulama manuel güncelleme gerektiriyor"
+    note "İpucu: ${BOLD}Latest.app${RESET} veya ${BOLD}Pearcleaner${RESET} ile kontrol et"
+}
+
+mod_audit_broken_casks() {
+    info "Bozuk cask'ler (App dosyası kayıp)"
+    have brew || { skip_module "brew yok"; return 99; }
+
+    local broken=0
+    while IFS= read -r cask; do
+        [[ -z "$cask" ]] && continue
+        # Cask'in yüklediği app adını bul
+        local app_name
+        app_name=$(brew info --json=v2 --cask "$cask" 2>/dev/null | \
+                   python3 -c "import sys, json; d=json.load(sys.stdin); apps=[a for c in d['casks'] for a in c.get('artifacts',[]) for a in (a.get('app',[]) if isinstance(a,dict) else [])]; print(apps[0] if apps else '')" 2>/dev/null)
+
+        [[ -z "$app_name" ]] && continue
+
+        if [[ ! -e "/Applications/$app_name" && ! -e "$HOME/Applications/$app_name" ]]; then
+            log "  ${RED}✗${RESET} $cask → $app_name (dosya kayıp)"
+            ((broken++))
+        fi
+    done < <(brew list --cask 2>/dev/null)
+
+    if (( broken > 0 )); then
+        warn "$broken bozuk cask bulundu"
+        note "Düzeltmek için her biri için: ${BOLD}brew uninstall --cask --force <ad> && brew install --cask <ad>${RESET}"
+    else
+        ok "Tüm cask'ler sağlam"
+    fi
+}
+
+mod_audit_duplicates() {
+    info "Kopya / bozuk uygulama dosyaları"
+    local -a patterns=(
+        "*.app arması"         # Türkçe "armor" suffix
+        "*.app arması 2"
+        "*.app arması 3"
+        "* 2.app"              # Finder duplicate
+        "* 3.app"
+        "* copy.app"
+        "* copy 2.app"
+    )
+
+    local found=0
+    for pattern in "${patterns[@]}"; do
+        while IFS= read -r -d '' app; do
+            local size; size=$(du -sh "$app" 2>/dev/null | awk '{print $1}')
+            log "  ${YELLOW}●${RESET} $app (${size:-?})"
+            ((found++))
+        done < <(find /Applications "$HOME/Applications" -maxdepth 2 -name "$pattern" -print0 2>/dev/null)
+    done
+
+    if (( found > 0 )); then
+        warn "$found kopya/bozuk dosya bulundu (disk yeri boşa harcıyor)"
+        note "İncele sonra sil: ${BOLD}rm -rf \"/Applications/<dosya>\"${RESET}"
+    else
+        ok "Kopya bulunamadı"
+    fi
+}
+
+mod_audit_orphan_formulae() {
+    info "Yalnız kalmış brew formulae (hiçbir şey bağımlı değil)"
+    have brew || { skip_module "brew yok"; return 99; }
+    # leaves = kimsenin dependency'si değil; leaves ∩ manuel-kurulanlar
+    local orphans; orphans=$(brew leaves)
+    local count; count=$(echo "$orphans" | wc -l | tr -d ' ')
+    note "Toplam $count leaf formula (bunların çoğu senin manuel kurulumların)"
+    note "Kullanmadıklarını tespit için: ${BOLD}brew autoremove --dry-run${RESET}"
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# OLLAMA
+# ═════════════════════════════════════════════════════════════════════
+
+mod_ollama() {
+    have ollama || { skip_module "ollama yok"; return 99; }
+    ollama list >/dev/null 2>&1 || { skip_module "Ollama daemon kapalı"; return 99; }
+
+    info "Yüklü Ollama modelleri:"
+    sh_run ollama list
+
+    note "Tüm modeller güncellenecek (her biri GB olabilir)"
+    confirm "Devam?" "N" || { skip_module "Ollama modelleri güncellenmedi — $CONFIRM_WHY"; return 99; }
+
+    local models; models=$(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}')
+    for m in $models; do
+        info "Pulling: $m"
+        sh_run ollama pull "$m" || warn "$m güncellenemedi"
+    done
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# GIT REPOS
+# ═════════════════════════════════════════════════════════════════════
+
+# repos_discover DİZİN — DİZİN altında REPOS_BUCKETS kovaları varsa yalnız
+# onların doğrudan alt dizinlerindeki depolar; yoksa DİZİN'in doğrudan alt
+# depoları (DİZİN'in kendisi depoysa o). İç içe klonlar ve worktree'ler
+# (.git'i dosya olanlar) kapsam dışı.
+repos_discover() {
+    local dir="$1" b d found=0
+    for b in "${REPOS_BUCKETS[@]}"; do
+        [[ -d "$dir/$b" ]] || continue
+        found=1
+        for d in "$dir/$b"/*/; do [[ -d "${d}.git" ]] && printf '%s\n' "${d%/}"; done
+    done
+    if (( found == 0 )); then
+        [[ -d "$dir/.git" ]] && printf '%s\n' "$dir"
+        for d in "$dir"/*/; do [[ -d "${d}.git" ]] && printf '%s\n' "${d%/}"; done
+    fi
+    return 0
+}
+
+# repo_state DEPO — ağa çıkmadan: ok | no-remote | detached | no-upstream | dirty
+# (izlenen dosyada değişiklik = dirty; yalnız izlenmeyen dosya engel değil,
+# git onların üzerine yazacak bir birleştirmeyi zaten reddeder)
+repo_state() {
+    local r="$1"
+    [[ -n "$(git -C "$r" remote 2>/dev/null)" ]] || { echo no-remote; return; }
+    git -C "$r" symbolic-ref -q HEAD >/dev/null 2>&1 || { echo detached; return; }
+    git -C "$r" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 || { echo no-upstream; return; }
+    [[ -z "$(GIT_OPTIONAL_LOCKS=0 git -C "$r" status --porcelain --untracked-files=no 2>/dev/null)" ]] \
+        || { echo dirty; return; }
+    echo ok
+}
+
+# repo_fetch DEPO ÇIKTI — etkileşimsiz, zaman aşımlı `git fetch --all --prune`.
+# Arka planda paralel çalışır: dönüş kodu ÇIKTI'ya, git çıktısı ÇIKTI.log'a.
+# Şifre/onay istemi beklemez (GIT_TERMINAL_PROMPT=0, ssh BatchMode).
+repo_fetch() {
+    local r="$1" out="$2" pid i=0 rc=0
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15" \
+        git -C "$r" fetch --all --prune --quiet >"$out.log" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( i >= REPOS_TIMEOUT * 5 )); then
+            pkill -TERM -P "$pid" 2>/dev/null
+            kill -TERM "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            echo "zaman aşımı (${REPOS_TIMEOUT} sn)" >>"$out.log"
+            echo 124 >"$out"
+            return 0
+        fi
+        sleep 0.2
+        ((i+=1))
+    done
+    wait "$pid" || rc=$?
+    echo "$rc" >"$out"
+}
+
+# repos_by_group DEPO... — kova başına tek satır: "  kova (n): ad ad …"
+# (sıra korunur; kovasız depolar REPOS_DIR adıyla gruplanır)
+repos_by_group() {
+    local r rel grp prev="" line="" n=0
+    for r in "$@"; do
+        rel="${r#"$REPOS_DIR"/}"
+        if [[ "$rel" == */* ]]; then grp="${rel%%/*}"; rel="${rel#*/}"; else grp="${REPOS_DIR##*/}"; fi
+        if [[ -n "$prev" && "$grp" != "$prev" ]]; then log "  $prev ($n):$line"; line=""; n=0; fi
+        prev="$grp"; line+=" $rel"; ((n+=1))
+    done
+    [[ -n "$prev" ]] && log "  $prev ($n):$line"
+    return 0
+}
+
+# --repos: depoları fetch eder, yalnız fast-forward ile günceller. Rebase,
+# merge commit, stash, reset yok; depo hook'ları çalıştırılmaz.
+mod_repos() {
+    have git || { skip_module "git yok"; return 99; }
+    [[ -d "$REPOS_DIR" ]] || { skip_module "$REPOS_DIR yok"; return 99; }
+    local r name i p running ahead behind tmpd why gone_note=""
+    local -a repos=() todo=() pids=() updated=() problems=() parts=() gone=()
+    local -a skip_dirty=() skip_noup=() skip_detached=() skip_noremote=()
+    mapfile -t repos < <(repos_discover "$REPOS_DIR")
+    (( ${#repos[@]} == 0 )) && { skip_module "$REPOS_DIR altında depo yok"; return 99; }
+
+    for r in "${repos[@]}"; do
+        name="${r#"$REPOS_DIR"/}"
+        case "$(repo_state "$r")" in
+            ok)          todo+=("$r") ;;
+            dirty)       skip_dirty+=("$name") ;;
+            no-upstream) skip_noup+=("$name") ;;
+            detached)    skip_detached+=("$name") ;;
+            *)           skip_noremote+=("$name") ;;
+        esac
+    done
+    info "Git depoları: ${#repos[@]} (${REPOS_DIR/#$HOME/\~}); ${#todo[@]} tanesi fetch + ff-only"
+    (( ${#skip_dirty[@]} ))    && parts+=("${#skip_dirty[@]} yerel değişiklikli")
+    (( ${#skip_noup[@]} ))     && parts+=("${#skip_noup[@]} upstream'siz")
+    (( ${#skip_detached[@]} )) && parts+=("${#skip_detached[@]} detached HEAD")
+    (( ${#skip_noremote[@]} )) && parts+=("${#skip_noremote[@]} remote'suz")
+    if (( ${#parts[@]} )); then
+        note "Dokunulmadı: $(join_list "${parts[@]}") (adlar logda)"
+        {
+            (( ${#skip_dirty[@]} ))    && printf 'repos — yerel değişiklikli: %s\n' "$(join_list "${skip_dirty[@]}")"
+            (( ${#skip_noup[@]} ))     && printf "repos — upstream'siz: %s\n" "$(join_list "${skip_noup[@]}")"
+            (( ${#skip_detached[@]} )) && printf 'repos — detached HEAD: %s\n' "$(join_list "${skip_detached[@]}")"
+            (( ${#skip_noremote[@]} )) && printf "repos — remote'suz: %s\n" "$(join_list "${skip_noremote[@]}")"
+        } >>"$LOG_FILE"
+    fi
+    (( ${#todo[@]} == 0 )) && { module_current "güncellenecek depo yok"; return 0; }
+
+    if (( DRY_RUN == 1 )); then
+        log "${DIM}\$ git fetch --all --prune && git merge --ff-only @{u}  (${#todo[@]} depo)${RESET}"
+        repos_by_group "${todo[@]}"
+        module_planned "${#todo[@]} depo fetch + ff-only edilecekti"
+        return 0
+    fi
+
+    tmpd=$(mktemp -d "${TMPDIR:-/tmp}/macupdate-repos.XXXXXX") || { module_failed "geçici dizin açılamadı"; return 1; }
+    log "${DIM}\$ git fetch --all --prune  (${#todo[@]} depo, ${REPOS_JOBS} paralel, depo başı ${REPOS_TIMEOUT} sn)${RESET}"
+    for i in "${!todo[@]}"; do
+        while :; do
+            running=0
+            for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && ((running+=1)); done
+            (( running < REPOS_JOBS )) && break
+            sleep 0.2
+        done
+        repo_fetch "${todo[$i]}" "$tmpd/$i" &
+        pids+=("$!")
+    done
+    for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+
+    for i in "${!todo[@]}"; do
+        r="${todo[$i]}"; name="${r#"$REPOS_DIR"/}"
+        if [[ -s "$tmpd/$i.log" ]]; then
+            printf '── repos: %s\n' "$name" >>"$LOG_FILE"
+            cat "$tmpd/$i.log" >>"$LOG_FILE"
+        fi
+        if [[ "$(cat "$tmpd/$i" 2>/dev/null)" != 0 ]]; then
+            why=$(grep -m1 -E '^(fatal|error):|zaman aşımı' "$tmpd/$i.log" 2>/dev/null || tail -n 1 "$tmpd/$i.log" 2>/dev/null)
+            log "  ${RED}✗${RESET} $name: fetch başarısız${why:+ — $why}"
+            problems+=("$name (fetch)")
+            continue
+        fi
+        # fetch --prune silinen uzak dalın izini kaldırır; "güncel" sayılmasın
+        if ! git -C "$r" rev-parse --verify -q '@{u}' >/dev/null 2>&1; then
+            gone+=("$name")
+            continue
+        fi
+        behind=$(git -C "$r" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+        ahead=$(git -C "$r" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+        (( behind == 0 )) && continue
+        if (( ahead > 0 )); then
+            log "  ${YELLOW}⇅${RESET} $name: ayrışmış (yerel +$ahead, uzak +$behind commit) — elle birleştir"
+            problems+=("$name (ayrışmış)")
+            continue
+        fi
+        if git -C "$r" -c core.hooksPath=/dev/null merge --ff-only --quiet '@{u}' >>"$LOG_FILE" 2>&1; then
+            log "  ${GREEN}↑${RESET} $name +$behind commit"
+            updated+=("$name")
+        else
+            log "  ${RED}✗${RESET} $name: ff-only birleştirilemedi (ayrıntı logda)"
+            problems+=("$name (merge)")
+        fi
+    done
+    rm -rf "$tmpd"
+
+    if (( ${#gone[@]} )); then
+        note "Dalın upstream'i silinmiş (PR birleşip uzak dal silinmiş olabilir), dokunulmadı: $(join_list "${gone[@]}")"
+        gone_note="; ${#gone[@]} depoda upstream silinmiş"
+    fi
+    if (( ${#problems[@]} > 0 )); then
+        module_partial "${#updated[@]} depo güncellendi; sorunlu: $(join_list "${problems[@]}")${gone_note}"
+    elif (( ${#updated[@]} > 0 )); then
+        module_updated "${#updated[@]} depo güncellendi${gone_note}"
+    else
+        module_current "$(( ${#todo[@]} - ${#gone[@]} )) depo güncel${gone_note}"
+    fi
+    return 0
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# INVENTORY — Kurulu her şeyin tarihli snapshot'ı (+ önceki ile diff)
+# ═════════════════════════════════════════════════════════════════════
+
+# İki snapshot'ın normalize manifest'lerini karşılaştır
+_inv_diff() {
+    local prev="$1" cur="$2"
+    [[ -f "$prev/manifest.txt" && -f "$cur/manifest.txt" ]] || return 0
+    local added removed
+    added=$(comm -13 "$prev/manifest.txt" "$cur/manifest.txt" || true)
+    removed=$(comm -23 "$prev/manifest.txt" "$cur/manifest.txt" || true)
+
+    if [[ -z "$added" && -z "$removed" ]]; then
+        ok "Değişiklik yok ($(basename "$prev") ile aynı)"
+        return 0
+    fi
+    log "\n${BOLD}Değişiklikler ($(basename "$prev") → şimdi):${RESET}"
+    while IFS= read -r l; do [[ -n "$l" ]] && log "  ${GREEN}+ $l${RESET}"; done <<< "$added"
+    while IFS= read -r l; do [[ -n "$l" ]] && log "  ${RED}- $l${RESET}"; done <<< "$removed"
+}
+
+mod_inventory() {
+    local stamp out
+    stamp=$(date +%Y%m%d-%H%M%S)
+    out="$INVENTORY_DIR/$stamp"
+
+    info "Envanter klasörü: $out"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        note "dry-run: envanter yazılmayacak"
+        return 0
+    fi
+    mkdir -p "$out" || { skip_module "Klasör oluşturulamadı: $out"; return 99; }
+
+    # ── Tam dökümler (insan-okur + arşiv) ────────────────────────────
+    if have brew; then
+        brew bundle dump --describe --file="$out/Brewfile" --force >/dev/null 2>&1 \
+            && ok "Brewfile (yeniden kurulabilir: brew bundle install)"
+        brew leaves --installed-on-request > "$out/brew-manual.txt" 2>/dev/null
+        brew list --formula                > "$out/brew-formulae.txt" 2>/dev/null
+        brew list --cask                   > "$out/brew-casks.txt" 2>/dev/null
+        brew services list                 > "$out/brew-services.txt" 2>/dev/null
+    fi
+    have mas      && mas list                       > "$out/mas.txt" 2>/dev/null
+    have npm      && npm ls -g --depth=0            > "$out/npm-global.txt" 2>/dev/null
+    have pnpm     && pnpm ls -g                     > "$out/pnpm-global.txt" 2>/dev/null
+    have yarn     && yarn global list               > "$out/yarn-global.txt" 2>/dev/null
+    have bun      && bun pm ls -g                   > "$out/bun-global.txt" 2>/dev/null
+    have pipx     && pipx list                      > "$out/pipx.txt" 2>/dev/null
+    have pip3     && pip3 freeze                     > "$out/pip-freeze.txt" 2>/dev/null
+    have cargo    && cargo install --list           > "$out/cargo.txt" 2>/dev/null
+    have gem      && gem list                        > "$out/gem.txt" 2>/dev/null
+    have composer && composer global show            > "$out/composer.txt" 2>/dev/null
+    have rustup   && rustup show                     > "$out/rustup.txt" 2>/dev/null
+    if have go; then
+        ls -1 "$(go env GOPATH 2>/dev/null)/bin" > "$out/go-bin.txt" 2>/dev/null || true
+    fi
+    have code     && code --list-extensions         > "$out/vscode-ext.txt" 2>/dev/null
+    have cursor   && cursor --list-extensions        > "$out/cursor-ext.txt" 2>/dev/null
+
+    # GUI app'ler — isim + versiyon (Info.plist; system_profiler -json bazen boş döner)
+    {
+        for _appdir in /Applications "$HOME/Applications"; do
+            [[ -d "$_appdir" ]] || continue
+            for _app in "$_appdir"/*.app; do
+                [[ -d "$_app" ]] || continue
+                _v=$(defaults read "$_app/Contents/Info" CFBundleShortVersionString 2>/dev/null \
+                     || defaults read "$_app/Contents/Info" CFBundleVersion 2>/dev/null || echo "?")
+                printf '%s\t%s\n' "$(basename "$_app" .app)" "$_v"
+            done
+        done
+    } 2>/dev/null | sort > "$out/applications.txt"
+
+    launchctl list                                    > "$out/launchd.txt" 2>/dev/null
+    osascript -e 'tell application "System Events" to get the name of every login item' \
+        > "$out/login-items.txt" 2>/dev/null
+    { sw_vers; echo; uname -a; echo; system_profiler SPHardwareDataType SPSoftwareDataType; } \
+        > "$out/system.txt" 2>/dev/null
+
+    # ── Normalize manifest (versiyon yok) — diff için tek kaynak ──────
+    {
+        have brew && brew leaves --installed-on-request 2>/dev/null | sed 's/^/brew:  /'
+        have brew && brew list --cask 2>/dev/null                    | sed 's/^/cask:  /'
+        have mas  && mas list 2>/dev/null | sed -E 's/^ *[0-9]+ +//; s/ +\([^)]*\)$//' | sed 's/^/mas:   /'
+        have npm  && npm ls -g --depth=0 2>/dev/null | awk 'NF>1 && $NF ~ /@/ {print $NF}' | sed -E 's/@[^@/]*$//' | sed 's/^/npm:   /'
+        have pipx && pipx list --short 2>/dev/null | awk '{print $1}'  | sed 's/^/pipx:  /'
+        have cargo && cargo install --list 2>/dev/null | grep -E '^[a-z]' | awk '{print $1}' | sed 's/^/cargo: /'
+        have code && code --list-extensions 2>/dev/null | sed 's/^/code:  /'
+        [[ -f "$out/applications.txt" ]] && cut -f1 "$out/applications.txt" | sed 's/^/app:   /'
+    } 2>/dev/null | sort -u > "$out/manifest.txt"
+
+    local n; n=$(wc -l < "$out/manifest.txt" | tr -d ' ')
+    ok "Envanter alındı — $n kalem · $out"
+
+    # 'latest' symlink (kolay erişim)
+    ln -sfn "$out" "$INVENTORY_DIR/latest" 2>/dev/null
+
+    # ── Önceki snapshot ile diff ─────────────────────────────────────
+    local prev
+    prev=$(find "$INVENTORY_DIR" -maxdepth 1 -mindepth 1 -type d ! -name "$stamp" 2>/dev/null \
+           | sort | tail -1)
+    if [[ -n "$prev" ]]; then
+        _inv_diff "$prev" "$out"
+    else
+        note "İlk snapshot — karşılaştırma için sonraki çalıştırmayı bekle"
+    fi
+    note "Git ile versiyonlamak istersen: cd $INVENTORY_DIR && git init && git add -A && git commit"
+    return 0
+}
+
+mod_doctor() {
+    local issues=0 checks=0 bad gem_bin
+    ((checks+=1)); [[ "$(uname -s)" == "Darwin" ]] || { warn "macOS değil"; ((issues+=1)); }
+    ((checks+=1)); (( $(disk_free_gb) >= 10 )) || { warn "Disk alanı 10 GB altında"; ((issues+=1)); }
+    ((checks+=1)); xcode-select -p >/dev/null 2>&1 || { warn "Command Line Tools seçili değil"; ((issues+=1)); }
+    if have brew; then
+        ((checks+=1)); brew doctor >>"$LOG_FILE" 2>&1 || { warn "brew doctor uyarı verdi"; ((issues+=1)); }
+    fi
+    # 'cache' kontrolü cache'te çöp toplar (değiştirir), 'versions' ise volta
+    # altında yalnız sürüm önerisidir; ikisi de çalıştırılmaz.
+    if have npm; then ((checks+=1)); npm doctor connection registry environment permissions >>"$LOG_FILE" 2>&1 || { warn "npm doctor uyarı verdi (ayrıntı logda)"; ((issues+=1)); }; fi
+    if have ruby || have gem; then
+        gem_bin=$(ruby_gem_bin) || gem_bin="gem"
+        ((checks+=1)); if bad=$(ruby_permission_problem "$gem_bin"); then warn "Ruby yazma izni sorunu: $bad"; ((issues+=1)); fi
+    fi
+    if have docker; then
+        ((checks+=1)); docker info >>"$LOG_FILE" 2>&1 || note "Docker kurulu fakat daemon kapalı"
+    fi
+    if (( issues == 0 )); then module_current "$checks kontrol temiz"
+    else module_partial "$issues/$checks kontrolde sorun"; fi
+    return 0
+}
+
+
+mod_doctor_report() { mod_doctor; }
+
+# ═════════════════════════════════════════════════════════════════════
+# RAPOR FONKSİYONLARI
+# ═════════════════════════════════════════════════════════════════════
+
+mod_brew_report() {
+    have brew || { module_skipped "brew yok"; return 99; }
+    local f c fc cc
+    capture_stdout f brew outdated --formula --quiet || true
+    capture_stdout c brew outdated --cask --greedy --quiet || true
+    fc=$(line_count "$f"); cc=$(line_count "$c")
+    log "Brew formulae outdated (${fc}):"; [[ -n "$f" ]] && log "$f" || log "  yok"
+    log "Brew cask outdated --greedy (${cc}):"; [[ -n "$c" ]] && log "$c" || log "  yok"
+    module_reported "$((fc+cc)) paket güncellemesi"
+}
+
+mod_mas_report() {
+    have mas || { module_skipped "mas yok"; return 99; }
+    local out rc count
+    capture_logged out mas outdated; rc=$?
+    (( QUIET == 0 )) && printf '%s\n' "$out"
+    (( rc != 0 )) && { module_failed "mas sorgusu başarısız"; return $rc; }
+    count=$(awk '/^[[:space:]]*[0-9]+[[:space:]]/{n++} END{print n+0}' <<<"$out")
+    module_reported "$count App Store güncellemesi"
+}
+
+mod_softwareupdate_report() {
+    [[ $SKIP_SYSTEM -eq 1 ]] && { module_skipped "--skip-system"; return 99; }
+    local out rc count
+    capture_logged out softwareupdate --list; rc=$?
+    (( QUIET == 0 )) && softwareupdate_filter "$out"
+    (( rc != 0 )) && { module_failed "softwareupdate sorgusu başarısız"; return $rc; }
+    count=$(grep -c '^\* Label:' <<<"$out" || true)
+    PENDING_UPDATES=$count
+    module_reported "$count sistem güncellemesi"
+}
+
+mod_node_report() {
+    local did=0 out count=0 volta_todo
+    if have npm; then
+        capture_logged out npm outdated -g || true
+        log "npm global outdated:"; [[ -n "$out" ]] && log "$out" || log "  yok"
+        capture_stdout out npm outdated -g --json || true
+        count=$((count + $(line_count "$(npm_outdated_names "$out")"))); did=1
+        if have volta; then
+            volta_todo=$(volta_pending "$(volta_packages)")
+            log "volta paketleri:"
+            if [[ -n "$volta_todo" ]]; then
+                log "$(awk -F'\t' 'NF {printf "  %s %s → %s\n", $1, $2, $3}' <<<"$volta_todo")"
+                # sürümü sorgulanamayan ("?") paket güncelleme sayılmaz
+                count=$((count + $(awk -F'\t' 'NF && $3 != "?" {n++} END {print n+0}' <<<"$volta_todo")))
+            else
+                log "  güncel"
+            fi
+        fi
+    fi
+    if have pnpm; then capture_logged out pnpm outdated -g || true; log "pnpm global outdated:"; [[ -n "$out" ]] && log "$out" || log "  yok"; did=1; fi
+    (( did == 0 )) && { module_skipped "Node paket yöneticisi yok"; return 99; }
+    module_reported "$count npm global güncellemesi"
+}
+
+mod_python_report() {
+    local did=0 out
+    if have pipx; then
+        if pipx upgrade-all --help 2>&1 | grep -q -- '--dry-run'; then capture_logged out pipx upgrade-all --dry-run || true
+        else capture_logged out pipx list --short || true; fi
+        log "$out"; did=1
+    fi
+    have poetry && { log "Poetry: $(poetry --version 2>/dev/null)"; did=1; }
+    have uv && { log "uv: $(uv --version 2>/dev/null)"; did=1; }
+    (( did == 0 )) && { module_skipped "Python araç yöneticisi yok"; return 99; }
+    module_reported "Python araçları listelendi"
+}
+
+mod_rust_report() {
+    have rustup || { module_skipped "rustup yok"; return 99; }
+    local out
+    capture_logged out rustup check || true; log "$out"
+    if have cargo && cargo install-update --version >/dev/null 2>&1; then
+        if cargo install-update --help 2>&1 | grep -q -- '--dry-run'; then capture_logged out cargo install-update -a --dry-run || true; log "$out"; fi
+    fi
+    module_reported "Rust toolchain kontrol edildi"
+}
+
+mod_ruby_report() {
+    local gem_bin out count bad
+    gem_bin=$(ruby_gem_bin) || { module_skipped "gem yok"; return 99; }
+    capture_stdout out env -u GEM_HOME -u GEM_PATH "$gem_bin" outdated || true
+    log "Ruby gems outdated:"; [[ -n "$out" ]] && log "$out" || log "  yok"
+    count=$(line_count "$(gem_user_outdated "$out" "$(ruby_shipped_gems "$gem_bin" || true)")")
+    if bad=$(ruby_permission_problem "$gem_bin"); then warn "Ruby yazma izni sorunu: $bad"; fi
+    module_reported "$count gem güncellemesi"
+}
+
+mod_go_report() {
+    have go || { module_skipped "go yok"; return 99; }
+    log "$(go version 2>/dev/null)"
+    log "Go build cache: $(human_kb "$(disk_used_kb "$(go env GOCACHE 2>/dev/null)")")"
+    log "Go module cache: $(human_kb "$(disk_used_kb "$(go env GOMODCACHE 2>/dev/null)")")"
+    have gup && { local out; capture_logged out gup check || true; log "$out"; }
+    module_reported "Go sürümü ve cache raporlandı"
+}
+
+mod_docker_report() {
+    [[ $SKIP_DOCKER -eq 1 ]] && { module_skipped "--skip-docker"; return 99; }
+    have docker || { module_skipped "docker yok"; return 99; }
+    docker info >/dev/null 2>&1 || { module_skipped "Docker daemon kapalı"; return 99; }
+    sh_run docker system df || true
+    module_reported "Docker disk kullanımı"
+}
+
+mod_cache_report() {
+    log "Homebrew cache : $(human_kb "$(disk_used_kb "$HOME/Library/Caches/Homebrew")")"
+    log "npm cache      : $(human_kb "$(disk_used_kb "$HOME/.npm/_cacache")")"
+    log "uv cache       : $(human_kb "$(disk_used_kb "$HOME/.cache/uv")")"
+    log "Xcode Derived  : $(human_kb "$(disk_used_kb "$HOME/Library/Developer/Xcode/DerivedData")")"
+    module_reported "cache boyutları"
+}
+
+mod_brew_services_report() {
+    have brew || { module_skipped "brew yok"; return 99; }
+    brew_services_check || { module_failed "servis listesi alınamadı"; return 1; }
+    module_reported "$BREW_SVC_DETAIL"
+}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ÇALIŞTIR
+# ═════════════════════════════════════════════════════════════════════
+
+for _grp in "${GROUP_ORDER[@]}"; do
+    group_enabled "$_grp" || continue
+    for _entry in "${MODULE_REGISTRY[@]}"; do
+        IFS=: read -r _g _name _fn <<<"$_entry"
+        [[ "$_g" == "$_grp" ]] && run_module "$_name" "$_fn"
+    done
+done
+unset _grp _entry _g _name _fn
+
+# ═════════════════════════════════════════════════════════════════════
+# ÖZET / JSON / BİLDİRİM
+# ═════════════════════════════════════════════════════════════════════
+END_TS=$(date +%s)
+ELAPSED=$((END_TS - START_TS))
+MIN=$((ELAPSED / 60)); SEC=$((ELAPSED % 60))
+DISK_FREE_AFTER=$(disk_free_gb)
+DISK_DELTA=$((DISK_FREE_AFTER - DISK_FREE_BEFORE))
+
+calculate_health() {
+    local score=100
+    score=$((score - ${#FAILURES[@]} * 20))
+    score=$((score - ${#PARTIALS[@]} * 8))
+    score=$((score - ${#AVAILABLE[@]} * 3))
+    if (( PENDING_UPDATES > 0 )); then
+        local pending_penalty=$((PENDING_UPDATES * 2))
+        (( pending_penalty > 10 )) && pending_penalty=10
+        score=$((score-pending_penalty))
+    fi
+    if (( DISK_FREE_AFTER < 10 )); then score=$((score-15))
+    elif (( DISK_FREE_AFTER < 20 )); then score=$((score-5)); fi
+    (( REBOOT_REQUIRED == 1 )) && score=$((score-5))
+    (( score < 0 )) && score=0
+    (( score > 100 )) && score=100
+    HEALTH_SCORE=$score
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+compute_exit_code() {
+    if (( ${#FAILURES[@]} > 0 )); then EXIT_CODE=1
+    elif (( ${#PARTIALS[@]} > 0 || REBOOT_REQUIRED == 1 )); then EXIT_CODE=$EX_PARTIAL
+    else EXIT_CODE=0; fi
+}
+
+write_json_summary() {
+    local target="${JSON_FILE:-$JSON_FILE_DEFAULT}" name first=1 w mode
+    mkdir -p "$(dirname "$target")"
+    if (( REPORT_ONLY == 1 )); then mode="report"
+    elif (( DRY_RUN == 1 )); then mode="dry-run"
+    else mode="update"; fi
+    {
+        printf '{\n'
+        printf '  "version": "%s",\n' "$(json_escape "$VERSION")"
+        printf '  "timestamp": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '  "mode": "%s",\n' "$mode"
+        printf '  "duration_seconds": %d,\n' "$ELAPSED"
+        printf '  "disk_free_before_gb": %d,\n' "$DISK_FREE_BEFORE"
+        printf '  "disk_free_after_gb": %d,\n' "$DISK_FREE_AFTER"
+        printf '  "health_score": %d,\n' "$HEALTH_SCORE"
+        printf '  "reboot_required": %s,\n' "$([[ $REBOOT_REQUIRED -eq 1 ]] && echo true || echo false)"
+        printf '  "pending_system_updates": %d,\n' "$PENDING_UPDATES"
+        printf '  "exit_code": %d,\n' "$EXIT_CODE"
+        printf '  "modules": {\n'
+        first=1
+        for name in "${MODULE_ORDER[@]}"; do
+            (( first == 0 )) && printf ',\n'; first=0
+            printf '    "%s": {"status": "%s", "detail": "%s", "duration_seconds": %d}' \
+                "$(json_escape "$name")" "$(json_escape "${MODULE_STATUS_MAP[$name]}")" \
+                "$(json_escape "${MODULE_DETAIL_MAP[$name]}")" "${TIMINGS[$name]:-0}"
+        done
+        printf '\n  },\n'
+        printf '  "warnings": ['
+        first=1
+        for w in "${WARNINGS[@]}"; do
+            (( first == 0 )) && printf ', '; first=0
+            printf '"%s"' "$(json_escape "$w")"
+        done
+        printf ']\n}\n'
+    } >"$target"
+    JSON_FILE="$target"
+}
+
+calculate_health
+compute_exit_code
+log "\n${BOLD}${MAGENTA}════════════════════ ÖZET ════════════════════${RESET}"
+log "Süre    : ${MIN}dk ${SEC}sn"
+if (( DRY_RUN == 1 )); then log "Disk    : ${DISK_FREE_BEFORE} GB (dry-run)"
+elif (( REPORT_ONLY == 1 )); then log "Disk    : ${DISK_FREE_AFTER} GB (rapor)"
+else
+    log "Disk    : ${DISK_FREE_BEFORE} GB → ${DISK_FREE_AFTER} GB"
+    (( DISK_DELTA > 0 )) && log "          ${GREEN}+${DISK_DELTA} GB boş alan${RESET}"
+    (( DISK_DELTA < 0 )) && log "          ${YELLOW}${DISK_DELTA} GB (indirme/kurulum)${RESET}"
+fi
+log "Sağlık  : ${HEALTH_SCORE}/100"
+(( REBOOT_REQUIRED == 1 )) && log "Yeniden başlatma: ${YELLOW}gerekli${RESET}"
+
+if (( DRY_RUN == 0 && ${#TIMINGS[@]} > 0 )); then
+    local_slow=""
+    for k in "${!TIMINGS[@]}"; do
+        (( ${TIMINGS[$k]} >= 2 )) && local_slow+="${TIMINGS[$k]} $k\n"
+    done
+    if [[ -n "$local_slow" ]]; then
+        log "\n${BOLD}En yavaş modüller:${RESET}"
+        while read -r t n; do [[ -n "$n" ]] && log "$(printf '  %3ss  %s' "$t" "$n")"; done < <(printf '%b' "$local_slow" | sort -rn | head -5)
+    fi
+fi
+
+log ""
+log "${GREEN}Güncellendi (${#UPDATED[@]}):${RESET} ${UPDATED[*]:-yok}"
+log "${GREEN}Güncel      (${#CURRENT[@]}):${RESET} ${CURRENT[*]:-yok}"
+log "${YELLOW}Mevcut      (${#AVAILABLE[@]}):${RESET} ${AVAILABLE[*]:-yok}"
+log "${CYAN}Tamamlandı  (${#COMPLETED[@]}):${RESET} ${COMPLETED[*]:-yok}"
+log "${YELLOW}Kısmi       (${#PARTIALS[@]}):${RESET} ${PARTIALS[*]:-yok}"
+(( REPORT_ONLY == 1 )) && log "${CYAN}Raporlandı  (${#REPORTED[@]}):${RESET} ${REPORTED[*]:-yok}"
+(( DRY_RUN == 1 )) && log "${CYAN}Planlandı   (${#PLANNED[@]}):${RESET} ${PLANNED[*]:-yok}"
+log "${YELLOW}Atlandı     (${#SKIPPED[@]}):${RESET} ${SKIPPED[*]:-yok}"
+log "${RED}Hata        (${#FAILURES[@]}):${RESET} ${FAILURES[*]:-yok}"
+
+if (( ${#WARNINGS[@]} > 0 )); then
+    log "\n${YELLOW}Uyarılar (${#WARNINGS[@]}):${RESET}"
+    for w in "${WARNINGS[@]}"; do log "  • $w"; done
+fi
+
+log "\nLog: $LOG_FILE"
+if (( JSON_MODE == 1 )); then
+    write_json_summary
+    (( JSON_ONLY == 0 )) && log "JSON: $JSON_FILE"
+fi
+
+if (( NOTIFY == 1 && DRY_RUN == 0 )) && have osascript; then
+    title="macupdate v$VERSION"
+    body="Sağlık $HEALTH_SCORE/100 · ${#UPDATED[@]} güncellendi · ${#FAILURES[@]} hata · ${MIN}dk ${SEC}sn"
+    osascript -e "display notification \"$body\" with title \"$title\"" >/dev/null 2>&1 || true
+fi
+
+if (( JSON_ONLY == 1 )); then cat "$JSON_FILE"; fi
+
+exit "$EXIT_CODE"
